@@ -1,5 +1,6 @@
 const std = @import("std");
 const ast = @import("ast.zig");
+const diag_mod = @import("diag.zig");
 
 pub const SymbolKind = enum { message, @"enum" };
 
@@ -65,16 +66,26 @@ pub const Resolver = struct {
     arena: std.mem.Allocator,
     files: []const ast.File,
     symbols: std.StringHashMapUnmanaged(Symbol) = .empty,
+    diag: ?*diag_mod.Diagnostic = null,
 
     /// Backward-compatible single-file entry point.
     pub fn build(arena: std.mem.Allocator, file: *const ast.File) !Resolver {
-        return buildMulti(arena, file[0..1]);
+        return buildMultiWithDiag(arena, file[0..1], null);
     }
 
     pub fn buildMulti(arena: std.mem.Allocator, files: []const ast.File) !Resolver {
+        return buildMultiWithDiag(arena, files, null);
+    }
+
+    pub fn buildMultiWithDiag(
+        arena: std.mem.Allocator,
+        files: []const ast.File,
+        diag: ?*diag_mod.Diagnostic,
+    ) !Resolver {
         var r = Resolver{
             .arena = arena,
             .files = files,
+            .diag = diag,
         };
         for (files, 0..) |*file, file_idx| {
             const pkg_prefix = file.package orelse "";
@@ -87,6 +98,16 @@ pub const Resolver = struct {
         }
         try r.validate();
         return r;
+    }
+
+    fn fail(self: *const Resolver, file_name: []const u8, comptime fmt: []const u8, args: anytype, err: anyerror) anyerror {
+        if (self.diag) |d| {
+            d.* = .{
+                .file = if (file_name.len > 0) file_name else "<input>",
+                .message = std.fmt.allocPrint(self.arena, fmt, args) catch @errorName(err),
+            };
+        }
+        return err;
     }
 
     fn joinDot(self: *Resolver, a: []const u8, b: []const u8) ![]const u8 {
@@ -134,25 +155,27 @@ pub const Resolver = struct {
     pub fn validate(self: *const Resolver) !void {
         for (self.files) |file| {
             const pkg_prefix = file.package orelse "";
-            for (file.enums) |e| try self.validateEnum(file.syntax, e);
+            for (file.enums) |e| try self.validateEnum(file.name, file.syntax, e);
             for (file.messages) |m| {
                 const fqn = if (pkg_prefix.len == 0)
                     m.name
                 else
                     try std.fmt.allocPrint(self.arena, "{s}.{s}", .{ pkg_prefix, m.name });
-                try self.validateMessage(file.syntax, m, fqn);
+                try self.validateMessage(file.name, file.syntax, m, fqn);
             }
         }
     }
 
-    fn validateEnum(self: *const Resolver, syntax: ast.Syntax, e: ast.Enum) !void {
+    fn validateEnum(self: *const Resolver, file_name: []const u8, syntax: ast.Syntax, e: ast.Enum) !void {
         if (syntax == .proto3 and (e.values.len == 0 or e.values[0].number != 0)) {
-            return error.Proto3EnumRequiresZeroFirst;
+            return self.fail(file_name, "proto3 enum '{s}' must have 0 as its first value", .{e.name}, error.Proto3EnumRequiresZeroFirst);
         }
         if (!e.allow_alias) {
             var seen: std.AutoHashMapUnmanaged(i32, void) = .empty;
             for (e.values) |v| {
-                if (seen.contains(v.number)) return error.DuplicateEnumValue;
+                if (seen.contains(v.number)) {
+                    return self.fail(file_name, "duplicate enum value {d} in '{s}' (set option allow_alias = true)", .{ v.number, e.name }, error.DuplicateEnumValue);
+                }
                 try seen.put(self.arena, v.number, {});
             }
         }
@@ -160,6 +183,8 @@ pub const Resolver = struct {
 
     fn validateFieldMeta(
         self: *const Resolver,
+        file_name: []const u8,
+        scope_fqn: []const u8,
         m: ast.Message,
         number: u29,
         name: []const u8,
@@ -167,46 +192,64 @@ pub const Resolver = struct {
         used_names: *std.StringHashMapUnmanaged(void),
     ) !void {
         if (number == 0 or number > 536_870_911 or (number >= 19000 and number <= 19999)) {
-            return error.InvalidFieldNumber;
+            return self.fail(file_name, "invalid field number {d} for '{s}.{s}'", .{ number, scope_fqn, name }, error.InvalidFieldNumber);
         }
         const num_i32: i32 = @intCast(number);
         for (m.reserved_ranges) |rr| {
-            if (num_i32 >= rr.start and num_i32 <= rr.end) return error.ReservedFieldNumber;
+            if (num_i32 >= rr.start and num_i32 <= rr.end) {
+                return self.fail(file_name, "field '{s}.{s}' uses reserved number {d}", .{ scope_fqn, name, number }, error.ReservedFieldNumber);
+            }
         }
         for (m.reserved_names) |rn| {
-            if (std.mem.eql(u8, rn, name)) return error.ReservedFieldName;
+            if (std.mem.eql(u8, rn, name)) {
+                return self.fail(file_name, "field '{s}.{s}' uses reserved name", .{ scope_fqn, name }, error.ReservedFieldName);
+            }
         }
-        if (used_numbers.contains(number)) return error.DuplicateFieldNumber;
+        if (used_numbers.contains(number)) {
+            return self.fail(file_name, "duplicate field number {d} in '{s}'", .{ number, scope_fqn }, error.DuplicateFieldNumber);
+        }
         try used_numbers.put(self.arena, number, {});
-        if (used_names.contains(name)) return error.DuplicateFieldName;
+        if (used_names.contains(name)) {
+            return self.fail(file_name, "duplicate field name '{s}' in '{s}'", .{ name, scope_fqn }, error.DuplicateFieldName);
+        }
         try used_names.put(self.arena, name, {});
     }
 
-    fn validateMessage(self: *const Resolver, syntax: ast.Syntax, m: ast.Message, scope_fqn: []const u8) !void {
-        for (m.nested_enums) |ne| try self.validateEnum(syntax, ne);
+    fn validateMessage(self: *const Resolver, file_name: []const u8, syntax: ast.Syntax, m: ast.Message, scope_fqn: []const u8) !void {
+        for (m.nested_enums) |ne| try self.validateEnum(file_name, syntax, ne);
         for (m.nested_messages) |nm| {
             const child_fqn = try std.fmt.allocPrint(self.arena, "{s}.{s}", .{ scope_fqn, nm.name });
-            try self.validateMessage(syntax, nm, child_fqn);
+            try self.validateMessage(file_name, syntax, nm, child_fqn);
         }
 
         var used_numbers: std.AutoHashMapUnmanaged(u29, void) = .empty;
         var used_names: std.StringHashMapUnmanaged(void) = .empty;
 
         for (m.fields) |f| {
-            try self.validateFieldMeta(m, f.number, f.name, &used_numbers, &used_names);
-            _ = try self.resolveType(scope_fqn, f.type_name);
+            try self.validateFieldMeta(file_name, scope_fqn, m, f.number, f.name, &used_numbers, &used_names);
+            _ = self.resolveType(scope_fqn, f.type_name) catch |err| {
+                return self.fail(file_name, "unknown type '{s}' on field '{s}.{s}'", .{ f.type_name, scope_fqn, f.name }, err);
+            };
         }
         for (m.maps) |mp| {
-            if (!isValidMapKeyType(mp.key_type)) return error.InvalidMapKeyType;
-            try self.validateFieldMeta(m, mp.number, mp.name, &used_numbers, &used_names);
-            _ = try self.resolveType(scope_fqn, mp.value_type);
+            if (!isValidMapKeyType(mp.key_type)) {
+                return self.fail(file_name, "invalid map key type '{s}' on '{s}.{s}'", .{ mp.key_type, scope_fqn, mp.name }, error.InvalidMapKeyType);
+            }
+            try self.validateFieldMeta(file_name, scope_fqn, m, mp.number, mp.name, &used_numbers, &used_names);
+            _ = self.resolveType(scope_fqn, mp.value_type) catch |err| {
+                return self.fail(file_name, "unknown map value type '{s}' on '{s}.{s}'", .{ mp.value_type, scope_fqn, mp.name }, err);
+            };
         }
         for (m.oneofs) |o| {
-            if (used_names.contains(o.name)) return error.DuplicateFieldName;
+            if (used_names.contains(o.name)) {
+                return self.fail(file_name, "duplicate oneof name '{s}' in '{s}'", .{ o.name, scope_fqn }, error.DuplicateFieldName);
+            }
             try used_names.put(self.arena, o.name, {});
             for (o.fields) |f| {
-                try self.validateFieldMeta(m, f.number, f.name, &used_numbers, &used_names);
-                _ = try self.resolveType(scope_fqn, f.type_name);
+                try self.validateFieldMeta(file_name, scope_fqn, m, f.number, f.name, &used_numbers, &used_names);
+                _ = self.resolveType(scope_fqn, f.type_name) catch |err| {
+                    return self.fail(file_name, "unknown type '{s}' on oneof field '{s}.{s}'", .{ f.type_name, scope_fqn, f.name }, err);
+                };
             }
         }
     }

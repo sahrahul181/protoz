@@ -149,4 +149,17 @@ pub fn build(b: *std.Build) void {
     run_fuzz.addPassthruArgs();
     b.step("fuzz", "Run cross-platform PRNG mutation & structured round-trip fuzzer (-- --iters N --seed S)")
         .dependOn(&run_fuzz.step);
+
+    const compiler_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/compiler_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "proto_wire", .module = wire_mod },
+                .{ .name = "bench_pb", .module = bench_pb.module },
+            },
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(compiler_tests).step);
 }

@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const ast = @import("ast.zig");
 const parser = @import("parser.zig");
+const diag_mod = @import("diag.zig");
 
 pub const LoadedWorkspace = struct {
     files: []ast.File,
@@ -17,12 +18,23 @@ pub const Loader = struct {
     visited: std.StringHashMapUnmanaged(VisitState) = .empty,
     files: std.ArrayList(ast.File) = .empty,
     disk_paths: std.ArrayList([]const u8) = .empty,
+    diag: ?*diag_mod.Diagnostic,
 
     pub fn load(
         arena: std.mem.Allocator,
         io: std.Io,
         include_dirs: []const []const u8,
         entry_files: []const []const u8,
+    ) !LoadedWorkspace {
+        return loadWithDiag(arena, io, include_dirs, entry_files, null);
+    }
+
+    pub fn loadWithDiag(
+        arena: std.mem.Allocator,
+        io: std.Io,
+        include_dirs: []const []const u8,
+        entry_files: []const []const u8,
+        diag: ?*diag_mod.Diagnostic,
     ) !LoadedWorkspace {
         var norm_includes: std.ArrayList([]const u8) = .empty;
         for (include_dirs) |dir| {
@@ -33,6 +45,7 @@ pub const Loader = struct {
             .arena = arena,
             .io = io,
             .include_dirs = try norm_includes.toOwnedSlice(arena),
+            .diag = diag,
         };
         for (entry_files) |entry| {
             const norm = try loader.normalizeEntry(entry);
@@ -43,6 +56,32 @@ pub const Loader = struct {
             .disk_paths = try loader.disk_paths.toOwnedSlice(arena),
         };
     }
+
+    // pub fn load(
+    //     arena: std.mem.Allocator,
+    //     io: std.Io,
+    //     include_dirs: []const []const u8,
+    //     entry_files: []const []const u8,
+    // ) !LoadedWorkspace {
+    //     var norm_includes: std.ArrayList([]const u8) = .empty;
+    //     for (include_dirs) |dir| {
+    //         try norm_includes.append(arena, try normalizePath(arena, dir));
+    //     }
+
+    //     var loader = Loader{
+    //         .arena = arena,
+    //         .io = io,
+    //         .include_dirs = try norm_includes.toOwnedSlice(arena),
+    //     };
+    //     for (entry_files) |entry| {
+    //         const norm = try loader.normalizeEntry(entry);
+    //         try loader.loadRecursive(norm.logical_name, norm.disk_path);
+    //     }
+    //     return .{
+    //         .files = try loader.files.toOwnedSlice(arena),
+    //         .disk_paths = try loader.disk_paths.toOwnedSlice(arena),
+    //     };
+    // }
 
     const Normalized = struct {
         logical_name: []const u8,
@@ -177,7 +216,15 @@ pub const Loader = struct {
         }
         try self.visited.put(self.arena, logical_name, .loading);
 
-        const disk_path = explicit_disk_path orelse try self.resolveImportDiskPath(logical_name);
+        const disk_path = explicit_disk_path orelse self.resolveImportDiskPath(logical_name) catch |err| {
+            if (self.diag) |d| {
+                d.* = .{
+                    .file = logical_name,
+                    .message = "imported .proto file not found in any -I search path",
+                };
+            }
+            return err;
+        };
         const src = try std.Io.Dir.cwd().readFileAlloc(self.io, disk_path, self.arena, .limited(16 << 20));
 
         var parsed = try parser.Parser.parse(self.arena, src);

@@ -1,6 +1,7 @@
 const std = @import("std");
 const lexer = @import("lexer.zig");
 const ast = @import("ast.zig");
+const diag_mod = @import("diag.zig");
 
 pub const ParseError = error{
     UnexpectedToken,
@@ -12,18 +13,31 @@ pub const max_field_number: i32 = 536_870_911;
 
 pub const Parser = struct {
     arena: std.mem.Allocator,
+    file_name: []const u8 = "<input>",
+    diag: ?*diag_mod.Diagnostic = null,
     lex: lexer.Lexer,
     cur: lexer.Token,
     peek1: lexer.Token,
     peek2: lexer.Token,
 
     pub fn parse(arena: std.mem.Allocator, src: []const u8) ParseError!ast.File {
+        return parseWithDiag(arena, "<input>", src, null);
+    }
+
+    pub fn parseWithDiag(
+        arena: std.mem.Allocator,
+        file_name: []const u8,
+        src: []const u8,
+        diag: ?*diag_mod.Diagnostic,
+    ) ParseError!ast.File {
         var lex = lexer.Lexer{ .src = src };
         const t0 = lex.next();
         const t1 = lex.next();
         const t2 = lex.next();
         var p = Parser{
             .arena = arena,
+            .file_name = file_name,
+            .diag = diag,
             .lex = lex,
             .cur = t0,
             .peek1 = t1,
@@ -40,8 +54,27 @@ pub const Parser = struct {
         return prev;
     }
 
+    fn fail(self: *Parser, tok: lexer.Token, comptime fmt: []const u8, args: anytype, err: ParseError) ParseError {
+        if (self.diag) |d| {
+            d.* = .{
+                .file = self.file_name,
+                .line = tok.line,
+                .col = tok.col,
+                .message = std.fmt.allocPrint(self.arena, fmt, args) catch @errorName(err),
+            };
+        }
+        return err;
+    }
+
     fn expect(self: *Parser, kind: lexer.TokenKind) ParseError!lexer.Token {
-        if (self.cur.kind != kind) return error.UnexpectedToken;
+        if (self.cur.kind != kind) {
+            return self.fail(
+                self.cur,
+                "expected {s}, found '{s}'",
+                .{ @tagName(kind), self.cur.text },
+                error.UnexpectedToken,
+            );
+        }
         return self.advance();
     }
 

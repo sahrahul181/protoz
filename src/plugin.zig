@@ -17,11 +17,47 @@ pub const Response = struct {
     files: []const GeneratedFile = &.{},
 };
 
-/// Processes a serialized `google.protobuf.compiler.CodeGeneratorRequest`
-/// and returns a serialized `google.protobuf.compiler.CodeGeneratorResponse`.
+pub const PluginOptions = struct {
+    wire_import: []const u8 = "proto_wire",
+    root_file: ?[]const u8 = null,
+    preserve_unknown_fields: bool = false,
+};
+
+fn parsePluginParams(raw: []const u8) !PluginOptions {
+    var opts: PluginOptions = .{};
+    if (raw.len == 0) return opts;
+
+    var it = std.mem.splitScalar(u8, raw, ',');
+    while (it.next()) |part| {
+        const item = std.mem.trim(u8, part, " \t\r\n");
+        if (item.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, item, '=') orelse return error.UnknownPluginParameter;
+        const key = std.mem.trim(u8, item[0..eq], " \t");
+        const val = std.mem.trim(u8, item[eq + 1 ..], " \t");
+        if (std.mem.eql(u8, key, "wire_import")) {
+            if (val.len == 0) return error.InvalidPluginParameter;
+            opts.wire_import = val;
+        } else if (std.mem.eql(u8, key, "root_file")) {
+            if (val.len == 0) return error.InvalidPluginParameter;
+            opts.root_file = val;
+        } else if (std.mem.eql(u8, key, "preserve_unknown_fields")) {
+            if (std.mem.eql(u8, val, "true") or std.mem.eql(u8, val, "1")) {
+                opts.preserve_unknown_fields = true;
+            } else if (std.mem.eql(u8, val, "false") or std.mem.eql(u8, val, "0")) {
+                opts.preserve_unknown_fields = false;
+            } else {
+                return error.InvalidPluginParameter;
+            }
+        } else {
+            return error.UnknownPluginParameter;
+        }
+    }
+    return opts;
+}
+
 pub fn processRequest(arena: std.mem.Allocator, req_bytes: []const u8) ![]u8 {
     const resp = processRequestTyped(arena, req_bytes) catch |err| Response{
-        .err = try std.fmt.allocPrint(arena, "protoc-gen-zig error: {s}", .{@errorName(err)}),
+        .err = try std.fmt.allocPrint(arena, "protoc-gen-zig: {s}", .{@errorName(err)}),
     };
     return encodeResponse(arena, resp);
 }
@@ -55,6 +91,7 @@ pub fn encodeResponse(arena: std.mem.Allocator, resp: Response) ![]u8 {
 fn processRequestTyped(arena: std.mem.Allocator, req_bytes: []const u8) !Response {
     var files_to_gen: std.StringHashMapUnmanaged(void) = .empty;
     var ast_files: std.ArrayList(ast.File) = .empty;
+    var parameter: []const u8 = "";
 
     var r = wire.Reader.init(req_bytes);
     while (try r.readTag()) |tag| {
@@ -62,6 +99,10 @@ fn processRequestTyped(arena: std.mem.Allocator, req_bytes: []const u8) !Respons
             1 => { // repeated string file_to_generate
                 if (tag.wire_type != .len) return error.WireTypeMismatch;
                 try files_to_gen.put(arena, try r.readBytes(), {});
+            },
+            2 => { // optional string parameter
+                if (tag.wire_type != .len) return error.WireTypeMismatch;
+                parameter = try r.readBytes();
             },
             15 => { // repeated FileDescriptorProto proto_file
                 if (tag.wire_type != .len) return error.WireTypeMismatch;
@@ -71,19 +112,43 @@ fn processRequestTyped(arena: std.mem.Allocator, req_bytes: []const u8) !Respons
         }
     }
 
+    const opts = try parsePluginParams(parameter);
     const all_files = try ast_files.toOwnedSlice(arena);
     const res = try resolver.Resolver.buildMulti(arena, all_files);
 
     var generated: std.ArrayList(GeneratedFile) = .empty;
+    var generated_protos: std.ArrayList([]const u8) = .empty;
+
     for (all_files, 0..) |file, idx| {
         if (!files_to_gen.contains(file.name)) continue;
 
         var buf: std.Io.Writer.Allocating = .init(arena);
-        try codegen.generateFile(arena, idx, &res, &buf.writer);
+        try codegen.generateFileWithOptions(arena, idx, &res, &buf.writer, .{
+            .wire_import = opts.wire_import,
+            .preserve_unknown_fields = opts.preserve_unknown_fields,
+        });
 
+        try generated_protos.append(arena, file.name);
         try generated.append(arena, .{
             .name = try codegen.protoToZigRelPath(arena, file.name),
             .content = try buf.toOwnedSlice(),
+        });
+    }
+
+    if (opts.root_file) |root_name| {
+        var root_src: std.Io.Writer.Allocating = .init(arena);
+        var used_exports: std.StringHashMapUnmanaged(void) = .empty;
+        try root_src.writer.writeAll("// Auto-generated package root by protoc-gen-zig.\n");
+        for (generated_protos.items) |proto_name| {
+            const rel_zig = try codegen.protoToZigRelPath(arena, proto_name);
+            const export_name = try codegen.makeUniqueRootExportName(arena, proto_name, &used_exports);
+            try root_src.writer.writeAll("pub const ");
+            try codegen.writeIdent(&root_src.writer, export_name);
+            try root_src.writer.print(" = @import(\"{s}\");\n", .{rel_zig});
+        }
+        try generated.append(arena, .{
+            .name = root_name,
+            .content = try root_src.toOwnedSlice(),
         });
     }
 
@@ -112,14 +177,16 @@ fn decodeFileDescriptorProto(arena: std.mem.Allocator, bytes: []const u8) !ast.F
             3 => try imports.append(arena, try r.readBytes()),
             4 => try raw_msgs.append(arena, try r.readBytes()),
             5 => try enums.append(arena, try decodeEnumDescriptor(arena, try r.readBytes())),
-            10 => { // public_dependency (packed or unpacked int32)
+            10 => { // public_dependency (repeated int32, packed or unpacked)
                 if (tag.wire_type == .len) {
-                    var sub = wire.Reader.init(try r.readBytes());
-                    while (!sub.eof()) {
-                        try public_imports.append(arena, @intCast(try sub.readVarint()));
+                    var pr = wire.Reader.init(try r.readBytes());
+                    while (!pr.eof()) {
+                        const raw_idx: i32 = @truncate(@as(i64, @bitCast(try pr.readVarint())));
+                        if (std.math.cast(usize, raw_idx)) |u| try public_imports.append(arena, u);
                     }
                 } else {
-                    try public_imports.append(arena, @intCast(try r.readVarint()));
+                    const raw_idx: i32 = @truncate(@as(i64, @bitCast(try r.readVarint())));
+                    if (std.math.cast(usize, raw_idx)) |u| try public_imports.append(arena, u);
                 }
             },
             12 => {
