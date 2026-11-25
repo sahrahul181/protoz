@@ -171,4 +171,27 @@ pub fn build(b: *std.Build) void {
         }),
     });
     test_step.dependOn(&b.addRunArtifact(compiler_tests).step);
+
+    // 7. Complex multi-file stress test (proto2 + proto3 + edition 2023 + WKTs + cycles + gRPC + JSON + unknown fields)
+    const stress_pkg = addProtoPackageWith(b, protoc_exe, wire_mod, b.path("include"), .{
+        .include_dirs = &.{b.path("tests/stress")},
+        .entry_protos = &.{b.path("tests/stress/complex.proto")},
+        .out_dir_name = "stress_pb",
+        .target = target,
+        .optimize = optimize,
+        .preserve_unknown_fields = true,
+    });
+    const stress_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/stress_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "proto_wire", .module = wire_mod },
+                .{ .name = "protoz", .module = protoz_mod },
+                .{ .name = "stress_pb", .module = stress_pkg.module },
+            },
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(stress_tests).step);
 }

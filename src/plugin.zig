@@ -169,6 +169,7 @@ fn decodeFileDescriptorProto(arena: std.mem.Allocator, bytes: []const u8) !ast.F
     var enums: std.ArrayList(ast.Enum) = .empty;
     var raw_msgs: std.ArrayList([]const u8) = .empty;
     var services: std.ArrayList(ast.Service) = .empty;
+    var raw_exts: std.ArrayList(RawField) = .empty;
 
     var r = wire.Reader.init(bytes);
     while (try r.readTag()) |tag| {
@@ -179,6 +180,7 @@ fn decodeFileDescriptorProto(arena: std.mem.Allocator, bytes: []const u8) !ast.F
             4 => try raw_msgs.append(arena, try r.readBytes()),
             5 => try enums.append(arena, try decodeEnumDescriptor(arena, try r.readBytes())),
             6 => try services.append(arena, try decodeServiceDescriptorProto(arena, try r.readBytes())),
+            7 => try raw_exts.append(arena, try decodeFieldDescriptor(try r.readBytes())),
             10 => { // public_dependency (repeated int32, packed or unpacked)
                 if (tag.wire_type == .len) {
                     var pr = wire.Reader.init(try r.readBytes());
@@ -222,6 +224,7 @@ fn decodeFileDescriptorProto(arena: std.mem.Allocator, bytes: []const u8) !ast.F
         .messages = try messages.toOwnedSlice(arena),
         .enums = try enums.toOwnedSlice(arena),
         .services = try services.toOwnedSlice(arena),
+        .extensions = try buildExtensionDecls(arena, raw_exts.items),
     };
 }
 
@@ -314,10 +317,12 @@ fn decodeEnumDescriptor(arena: std.mem.Allocator, bytes: []const u8) !ast.Enum {
 
 const RawField = struct {
     name: []const u8 = "",
+    extendee: []const u8 = "",
     number: u29 = 0,
     label: u32 = 1, // 1=OPTIONAL, 2=REQUIRED, 3=REPEATED
     type_enum: u32 = 0,
     type_name: []const u8 = "",
+    default_value: ?[]const u8 = null,
     packed_opt: ?bool = null,
     oneof_index: ?usize = null,
     proto3_optional: bool = false,
@@ -345,7 +350,7 @@ fn fieldProtoTypeName(f: RawField) ![]const u8 {
         7 => "fixed32",
         8 => "bool",
         9 => "string",
-        11, 14 => f.type_name, // MESSAGE / ENUM
+        10, 11, 14 => f.type_name, // GROUP / MESSAGE / ENUM
         12 => "bytes",
         13 => "uint32",
         15 => "sfixed32",
@@ -356,16 +361,51 @@ fn fieldProtoTypeName(f: RawField) ![]const u8 {
     };
 }
 
+fn buildFieldOptions(arena: std.mem.Allocator, rf: RawField) ![]ast.Option {
+    var opts: std.ArrayList(ast.Option) = .empty;
+    if (rf.packed_opt) |p| {
+        try opts.append(arena, .{ .name = "packed", .raw_value = if (p) "true" else "false" });
+    }
+    if (rf.default_value) |dv| {
+        try opts.append(arena, .{ .name = "default", .raw_value = dv });
+    }
+    return opts.toOwnedSlice(arena);
+}
+
+fn buildExtensionDecls(arena: std.mem.Allocator, raw_exts: []const RawField) ![]ast.ExtensionDecl {
+    var decls: std.ArrayList(ast.ExtensionDecl) = .empty;
+    for (raw_exts) |rf| {
+        const type_name = try fieldProtoTypeName(rf);
+        const opts = try buildFieldOptions(arena, rf);
+        const f_arr = try arena.alloc(ast.Field, 1);
+        f_arr[0] = .{
+            .label = if (rf.label == 3) .repeated else .optional,
+            .type_name = type_name,
+            .name = rf.name,
+            .number = rf.number,
+            .options = opts,
+            .is_group = (rf.type_enum == 10),
+        };
+        try decls.append(arena, .{
+            .extendee = rf.extendee,
+            .fields = f_arr,
+        });
+    }
+    return decls.toOwnedSlice(arena);
+}
+
 fn decodeFieldDescriptor(bytes: []const u8) !RawField {
     var f: RawField = .{};
     var r = wire.Reader.init(bytes);
     while (try r.readTag()) |tag| {
         switch (tag.field_number) {
             1 => f.name = try r.readBytes(),
+            2 => f.extendee = try r.readBytes(),
             3 => f.number = @truncate(try r.readVarint()),
             4 => f.label = @truncate(try r.readVarint()),
             5 => f.type_enum = @truncate(try r.readVarint()),
             6 => f.type_name = try r.readBytes(),
+            7 => f.default_value = try r.readBytes(),
             8 => { // FieldOptions
                 var ordr = wire.Reader.init(try r.readBytes());
                 while (try ordr.readTag()) |ot| {
@@ -395,6 +435,8 @@ fn decodeDescriptorProto(
     var raw_nested: std.ArrayList([]const u8) = .empty;
     var nested_enums: std.ArrayList(ast.Enum) = .empty;
     var oneof_names: std.ArrayList([]const u8) = .empty;
+    var extension_ranges: std.ArrayList(ast.ReservedRange) = .empty;
+    var raw_exts: std.ArrayList(RawField) = .empty;
     var is_map_entry = false;
 
     var r = wire.Reader.init(bytes);
@@ -404,6 +446,22 @@ fn decodeDescriptorProto(
             2 => try raw_fields.append(arena, try decodeFieldDescriptor(try r.readBytes())),
             3 => try raw_nested.append(arena, try r.readBytes()),
             4 => try nested_enums.append(arena, try decodeEnumDescriptor(arena, try r.readBytes())),
+            5 => { // ExtensionRange (start=1 inclusive, end=2 exclusive)
+                var start_n: i32 = 0;
+                var end_excl: i32 = 0;
+                var er = wire.Reader.init(try r.readBytes());
+                while (try er.readTag()) |et| {
+                    switch (et.field_number) {
+                        1 => start_n = @truncate(@as(i64, @bitCast(try er.readVarint()))),
+                        2 => end_excl = @truncate(@as(i64, @bitCast(try er.readVarint()))),
+                        else => try er.skipField(et, wire.max_recursion_depth),
+                    }
+                }
+                if (end_excl > start_n) {
+                    try extension_ranges.append(arena, .{ .start = start_n, .end = end_excl - 1 });
+                }
+            },
+            6 => try raw_exts.append(arena, try decodeFieldDescriptor(try r.readBytes())),
             7 => { // MessageOptions
                 var mr = wire.Reader.init(try r.readBytes());
                 while (try mr.readTag()) |mt| {
@@ -482,8 +540,6 @@ fn decodeDescriptorProto(
     var maps: std.ArrayList(ast.MapField) = .empty;
 
     for (raw_fields.items) |rf| {
-        if (rf.type_enum == 10) continue; // Skip legacy Proto2 GROUP fields
-
         // Reconstruct map<K, V>
         if (rf.label == 3 and rf.type_enum == 11) {
             if (map_entries.get(rf.type_name)) |mt| {
@@ -498,13 +554,9 @@ fn decodeDescriptorProto(
             }
         }
 
-        const opts: []ast.Option = if (rf.packed_opt) |p| blk: {
-            const o = try arena.alloc(ast.Option, 1);
-            o[0] = .{ .name = "packed", .raw_value = if (p) "true" else "false" };
-            break :blk o;
-        } else &.{};
-
+        const opts = try buildFieldOptions(arena, rf);
         const type_name = try fieldProtoTypeName(rf);
+        const is_group = (rf.type_enum == 10);
 
         if (rf.oneof_index) |oi| {
             if (oi < synthetic_oneof.len and !synthetic_oneof[oi]) {
@@ -514,6 +566,7 @@ fn decodeDescriptorProto(
                     .name = rf.name,
                     .number = rf.number,
                     .options = opts,
+                    .is_group = is_group,
                 });
                 continue;
             }
@@ -534,6 +587,7 @@ fn decodeDescriptorProto(
             .name = rf.name,
             .number = rf.number,
             .options = opts,
+            .is_group = is_group,
         });
     }
 
@@ -554,6 +608,8 @@ fn decodeDescriptorProto(
             .oneofs = try oneofs.toOwnedSlice(arena),
             .nested_messages = try nested_messages.toOwnedSlice(arena),
             .nested_enums = try nested_enums.toOwnedSlice(arena),
+            .extension_ranges = try extension_ranges.toOwnedSlice(arena),
+            .extensions = try buildExtensionDecls(arena, raw_exts.items),
         },
         .is_map_entry = false,
         .map_types = null,

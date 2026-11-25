@@ -174,9 +174,25 @@ inline fn invokeUnaryHandler(
     return res;
 }
 
+fn hasUnaryHandler(comptime H: type, comptime Method: type) bool {
+    return @hasDecl(H, Method.zig_name) or @hasDecl(H, Method.name);
+}
+
+/// Optional compile-time exhaustiveness check for servers that want a build error
+/// if any unary RPC in `Service` is missing from `Handler`.
+pub fn assertCompleteUnaryHandler(comptime Service: type, comptime Handler: type) void {
+    const H = DerefType(Handler);
+    inline for (Service.methods) |Method| {
+        if (comptime Method.stream_kind == .unary and !hasUnaryHandler(H, Method)) {
+            @compileError("RPC handler " ++ @typeName(H) ++ " is missing unary method `" ++ Method.zig_name ++ "` (" ++ Method.path ++ ")");
+        }
+    }
+}
+
 /// Zero-allocation comptime unary RPC dispatcher for raw Protobuf payloads.
 /// Matches `path` (e.g. `"/acme.v1.Greeter/SayHello"`), decodes `Request`, invokes
 /// `handler.<camelCase>` (or `handler.<PascalCase>`), and encodes `Response` into `resp_buf`.
+/// Unary methods omitted from `handler` return `error.Unimplemented`.
 pub fn dispatchUnary(
     comptime Service: type,
     handler: anytype,
@@ -186,7 +202,7 @@ pub fn dispatchUnary(
 ) ![]const u8 {
     const H = DerefType(@TypeOf(handler));
     inline for (Service.methods) |Method| {
-        if (comptime Method.stream_kind == .unary) {
+        if (comptime Method.stream_kind == .unary and hasUnaryHandler(H, Method)) {
             if (eqlPath(path, Method.path)) {
                 const req = try Method.Request.decode(req_bytes);
                 const resp = try invokeUnaryHandler(H, Method, handler, req);
@@ -198,6 +214,7 @@ pub fn dispatchUnary(
 }
 
 /// Zero-allocation comptime unary RPC dispatcher for 5-byte gRPC Length-Prefixed frames.
+/// Unary methods omitted from `handler` return `error.Unimplemented`.
 pub fn dispatchUnaryGrpc(
     comptime Service: type,
     handler: anytype,
@@ -208,11 +225,187 @@ pub fn dispatchUnaryGrpc(
 ) ![]const u8 {
     const H = DerefType(@TypeOf(handler));
     inline for (Service.methods) |Method| {
-        if (comptime Method.stream_kind == .unary) {
+        if (comptime Method.stream_kind == .unary and hasUnaryHandler(H, Method)) {
             if (eqlPath(path, Method.path)) {
                 const frame = (try tryDecodeGrpc(Method.Request, req_frame_bytes, max_frame_bytes)) orelse return error.UnexpectedEof;
                 const resp = try invokeUnaryHandler(H, Method, handler, frame.msg);
                 return try encodeGrpcSlice(resp, resp_buf);
+            }
+        }
+    }
+    return error.Unimplemented;
+}
+
+/// Typed zero-allocation gRPC response stream writer passed to server/bidi streaming handlers.
+pub fn GrpcFrameWriter(comptime M: type, comptime W: type) type {
+    return struct {
+        w: W,
+
+        pub inline fn send(self: *@This(), msg: M) (wire.WriterError(W) || error{MessageTooLarge})!void {
+            try encodeGrpc(msg, self.w);
+        }
+    };
+}
+
+fn handlerDeclName(comptime H: type, comptime Method: type) []const u8 {
+    if (@hasDecl(H, Method.zig_name)) return Method.zig_name;
+    if (@hasDecl(H, Method.name)) return Method.name;
+    @compileError("RPC handler " ++ @typeName(H) ++ " must declare `pub fn " ++ Method.zig_name ++ "` or `" ++ Method.name ++ "`");
+}
+
+inline fn invokeClientStreamHandler(
+    comptime H: type,
+    comptime Method: type,
+    handler: anytype,
+    stream: *GrpcFrameIterator(Method.Request),
+) !Method.Response {
+    const res = @field(H, handlerDeclName(H, Method))(handler, stream);
+    if (comptime @typeInfo(@TypeOf(res)) == .error_union) return try res;
+    return res;
+}
+
+inline fn invokeServerStreamHandler(
+    comptime H: type,
+    comptime Method: type,
+    handler: anytype,
+    req: Method.Request,
+    stream: anytype,
+) !void {
+    const res = @field(H, handlerDeclName(H, Method))(handler, req, stream);
+    if (comptime @typeInfo(@TypeOf(res)) == .error_union) return try res;
+}
+
+inline fn invokeBidiStreamHandler(
+    comptime H: type,
+    comptime Method: type,
+    handler: anytype,
+    in_stream: *GrpcFrameIterator(Method.Request),
+    out_stream: anytype,
+) !void {
+    const res = @field(H, handlerDeclName(H, Method))(handler, in_stream, out_stream);
+    if (comptime @typeInfo(@TypeOf(res)) == .error_union) return try res;
+}
+
+/// Optional compile-time exhaustiveness check across ALL RPCs (unary + streaming).
+pub fn assertCompleteHandler(comptime Service: type, comptime Handler: type) void {
+    const H = DerefType(Handler);
+    inline for (Service.methods) |Method| {
+        if (comptime !hasUnaryHandler(H, Method)) {
+            @compileError("RPC handler " ++ @typeName(H) ++ " is missing method `" ++ Method.zig_name ++ "` (" ++ Method.path ++ ")");
+        }
+    }
+}
+
+/// Dispatches a `client_streaming` gRPC call: handler receives `*GrpcFrameIterator(Request)`
+/// and returns `Response` (or `!Response`), encoded as a single 5-byte gRPC frame into `resp_buf`.
+pub fn dispatchClientStreamGrpc(
+    comptime Service: type,
+    handler: anytype,
+    path: []const u8,
+    req_frames_bytes: []const u8,
+    max_frame_bytes: usize,
+    resp_buf: []u8,
+) ![]const u8 {
+    const H = DerefType(@TypeOf(handler));
+    inline for (Service.methods) |Method| {
+        if (comptime Method.stream_kind == .client_streaming and hasUnaryHandler(H, Method)) {
+            if (eqlPath(path, Method.path)) {
+                var in_stream = GrpcFrameIterator(Method.Request).init(req_frames_bytes, max_frame_bytes);
+                const resp = try invokeClientStreamHandler(H, Method, handler, &in_stream);
+                return try encodeGrpcSlice(resp, resp_buf);
+            }
+        }
+    }
+    return error.Unimplemented;
+}
+
+/// Dispatches a `server_streaming` gRPC call: handler receives `(Request, *GrpcFrameWriter(Response, W))`
+/// and calls `try stream.send(msg)` for each outgoing frame.
+pub fn dispatchServerStreamGrpc(
+    comptime Service: type,
+    handler: anytype,
+    path: []const u8,
+    req_frame_bytes: []const u8,
+    max_frame_bytes: usize,
+    resp_writer: anytype,
+) !void {
+    const H = DerefType(@TypeOf(handler));
+    const W = @TypeOf(resp_writer);
+    inline for (Service.methods) |Method| {
+        if (comptime Method.stream_kind == .server_streaming and hasUnaryHandler(H, Method)) {
+            if (eqlPath(path, Method.path)) {
+                const frame = (try tryDecodeGrpc(Method.Request, req_frame_bytes, max_frame_bytes)) orelse return error.UnexpectedEof;
+                var out_stream: GrpcFrameWriter(Method.Response, W) = .{ .w = resp_writer };
+                try invokeServerStreamHandler(H, Method, handler, frame.msg, &out_stream);
+                return;
+            }
+        }
+    }
+    return error.Unimplemented;
+}
+
+/// Dispatches a `bidi_streaming` gRPC call: handler receives
+/// `(*GrpcFrameIterator(Request), *GrpcFrameWriter(Response, W))`.
+pub fn dispatchBidiStreamGrpc(
+    comptime Service: type,
+    handler: anytype,
+    path: []const u8,
+    req_frames_bytes: []const u8,
+    max_frame_bytes: usize,
+    resp_writer: anytype,
+) !void {
+    const H = DerefType(@TypeOf(handler));
+    const W = @TypeOf(resp_writer);
+    inline for (Service.methods) |Method| {
+        if (comptime Method.stream_kind == .bidi_streaming and hasUnaryHandler(H, Method)) {
+            if (eqlPath(path, Method.path)) {
+                var in_stream = GrpcFrameIterator(Method.Request).init(req_frames_bytes, max_frame_bytes);
+                var out_stream: GrpcFrameWriter(Method.Response, W) = .{ .w = resp_writer };
+                try invokeBidiStreamHandler(H, Method, handler, &in_stream, &out_stream);
+                return;
+            }
+        }
+    }
+    return error.Unimplemented;
+}
+
+/// Unified zero-allocation gRPC dispatcher covering unary, client, server, and bidi RPCs.
+pub fn dispatchGrpc(
+    comptime Service: type,
+    handler: anytype,
+    path: []const u8,
+    req_bytes: []const u8,
+    max_frame_bytes: usize,
+    resp_writer: anytype,
+) !void {
+    const H = DerefType(@TypeOf(handler));
+    const W = @TypeOf(resp_writer);
+    inline for (Service.methods) |Method| {
+        if (comptime hasUnaryHandler(H, Method)) {
+            if (eqlPath(path, Method.path)) {
+                switch (comptime Method.stream_kind) {
+                    .unary => {
+                        const frame = (try tryDecodeGrpc(Method.Request, req_bytes, max_frame_bytes)) orelse return error.UnexpectedEof;
+                        const resp = try invokeUnaryHandler(H, Method, handler, frame.msg);
+                        try encodeGrpc(resp, resp_writer);
+                    },
+                    .client_streaming => {
+                        var in_stream = GrpcFrameIterator(Method.Request).init(req_bytes, max_frame_bytes);
+                        const resp = try invokeClientStreamHandler(H, Method, handler, &in_stream);
+                        try encodeGrpc(resp, resp_writer);
+                    },
+                    .server_streaming => {
+                        const frame = (try tryDecodeGrpc(Method.Request, req_bytes, max_frame_bytes)) orelse return error.UnexpectedEof;
+                        var out_stream: GrpcFrameWriter(Method.Response, W) = .{ .w = resp_writer };
+                        try invokeServerStreamHandler(H, Method, handler, frame.msg, &out_stream);
+                    },
+                    .bidi_streaming => {
+                        var in_stream = GrpcFrameIterator(Method.Request).init(req_bytes, max_frame_bytes);
+                        var out_stream: GrpcFrameWriter(Method.Response, W) = .{ .w = resp_writer };
+                        try invokeBidiStreamHandler(H, Method, handler, &in_stream, &out_stream);
+                    },
+                }
+                return;
             }
         }
     }

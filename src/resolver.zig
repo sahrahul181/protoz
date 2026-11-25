@@ -169,6 +169,7 @@ pub const Resolver = struct {
                     try self.validateRpcEndpointType(file.name, pkg_prefix, svc.name, rpc.name, "response", rpc.res_type);
                 }
             }
+            try self.validateExtensions(file.name, pkg_prefix, file.extensions);
         }
     }
 
@@ -223,6 +224,11 @@ pub const Resolver = struct {
                 return self.fail(file_name, "field '{s}.{s}' uses reserved number {d}", .{ scope_fqn, name, number }, error.ReservedFieldNumber);
             }
         }
+        for (m.extension_ranges) |er| {
+            if (num_i32 >= er.start and num_i32 <= er.end) {
+                return self.fail(file_name, "field '{s}.{s}' number {d} falls inside an extension range", .{ scope_fqn, name, number }, error.FieldNumberInExtensionRange);
+            }
+        }
         for (m.reserved_names) |rn| {
             if (std.mem.eql(u8, rn, name)) {
                 return self.fail(file_name, "field '{s}.{s}' uses reserved name", .{ scope_fqn, name }, error.ReservedFieldName);
@@ -272,6 +278,48 @@ pub const Resolver = struct {
                 try self.validateFieldMeta(file_name, scope_fqn, m, f.number, f.name, &used_numbers, &used_names);
                 _ = self.resolveType(scope_fqn, f.type_name) catch |err| {
                     return self.fail(file_name, "unknown type '{s}' on oneof field '{s}.{s}'", .{ f.type_name, scope_fqn, f.name }, err);
+                };
+            }
+        }
+        try self.validateExtensions(file_name, scope_fqn, m.extensions);
+    }
+
+    fn validateExtensions(
+        self: *const Resolver,
+        file_name: []const u8,
+        scope_fqn: []const u8,
+        extensions: []const ast.ExtensionDecl,
+    ) !void {
+        for (extensions) |ext| {
+            const rt = self.resolveType(scope_fqn, ext.extendee) catch |err| {
+                return self.fail(file_name, "unknown extendee type '{s}' in extend block", .{ext.extendee}, err);
+            };
+            if (rt != .message) {
+                return self.fail(file_name, "extendee '{s}' must be a message", .{ext.extendee}, error.ExtendeeMustBeMessage);
+            }
+            const host_msg = rt.message.msg;
+            for (ext.fields) |f| {
+                if (f.label == .required) {
+                    return self.fail(file_name, "extension field '{s}' cannot be required", .{f.name}, error.RequiredExtensionNotAllowed);
+                }
+                if (f.number == 0 or f.number > 536_870_911 or (f.number >= 19000 and f.number <= 19999)) {
+                    return self.fail(file_name, "invalid extension field number {d} for '{s}'", .{ f.number, f.name }, error.InvalidFieldNumber);
+                }
+                if (host_msg) |hm| {
+                    const num_i32: i32 = @intCast(f.number);
+                    var in_range = false;
+                    for (hm.extension_ranges) |er| {
+                        if (num_i32 >= er.start and num_i32 <= er.end) {
+                            in_range = true;
+                            break;
+                        }
+                    }
+                    if (!in_range) {
+                        return self.fail(file_name, "extension '{s}' number {d} is outside extension ranges of '{s}'", .{ f.name, f.number, rt.message.proto_fqn }, error.ExtensionNumberOutOfRange);
+                    }
+                }
+                _ = self.resolveType(scope_fqn, f.type_name) catch |err| {
+                    return self.fail(file_name, "unknown type '{s}' on extension '{s}'", .{ f.type_name, f.name }, err);
                 };
             }
         }

@@ -1,0 +1,10 @@
+syntax = "proto3";
+package stress.facade;
+
+import public "base/common.proto";
+import public "google/protobuf/timestamp.proto";
+
+// Intentionally shadows stress.base.EmptyMarker
+message EmptyMarker {
+  uint32 shadowed_tag = 1;
+}

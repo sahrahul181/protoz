@@ -3,6 +3,7 @@ const std = @import("std");
 pub const wkt = @import("wkt.zig");
 pub const json = @import("json.zig");
 pub const rpc = @import("rpc.zig");
+pub const math = std.math;
 pub const Writer = std.Io.Writer;
 pub const Allocator = std.mem.Allocator;
 pub const CloneError = DecodeError || Allocator.Error;
@@ -49,6 +50,7 @@ pub const DecodeError = error{
     RecursionLimitExceeded,
     InvalidUtf8,
     MergeChunkLimitExceeded,
+    MissingRequiredField,
 };
 
 pub inline fn rawTag(comptime field_number: u29, comptime wt: WireType) u32 {
@@ -486,6 +488,22 @@ pub const Reader = struct {
             .bytes = start[0..len],
         };
     }
+
+    /// Consumes fields until the matching `EGROUP` tag for `field_number` and returns
+    /// the inner body slice (excluding the closing `EGROUP` tag).
+    pub fn readGroupBytes(self: *Reader, field_number: u29, depth: u32) DecodeError![]const u8 {
+        if (depth == 0) return error.RecursionLimitExceeded;
+        const body_start = self.ptr;
+        while (true) {
+            const tag_start = self.ptr;
+            const tag = (try self.readTag()) orelse return error.UnexpectedEof;
+            if (tag.wire_type == .egroup) {
+                if (tag.field_number != field_number) return error.UnmatchedEndGroup;
+                return body_start[0 .. @intFromPtr(tag_start) - @intFromPtr(body_start)];
+            }
+            try self.skipField(tag, depth - 1);
+        }
+    }
 };
 
 /// Shift-free packed varint validation loop enforcing 10-byte / bit-63 overflow checks.
@@ -891,10 +909,13 @@ pub fn Lazy(comptime M: type) type {
                 .wire => |w| blk: {
                     var msg: M = .{};
                     var r = Reader.init(w.buf);
-                    const expected_raw: u32 = (@as(u32, w.field_number) << 3) | @backingInt(WireType.len);
+                    const expected_len: u32 = (@as(u32, w.field_number) << 3) | @backingInt(WireType.len);
+                    const expected_grp: u32 = (@as(u32, w.field_number) << 3) | @backingInt(WireType.sgroup);
                     while (try r.readRawTag()) |raw_tag| {
-                        if (raw_tag == expected_raw) {
+                        if (raw_tag == expected_len) {
                             try msg.mergeDepth(try r.readBytes(), depth);
+                        } else if (raw_tag == expected_grp) {
+                            try msg.mergeDepth(try r.readGroupBytes(w.field_number, depth), depth);
                         } else {
                             const tag = try decodeTag(raw_tag);
                             try r.skipField(tag, depth);
@@ -919,10 +940,13 @@ pub fn Lazy(comptime M: type) type {
                 .wire => |w| blk: {
                     var total: usize = 0;
                     var r = Reader.init(w.buf);
-                    const expected_raw: u32 = (@as(u32, w.field_number) << 3) | @backingInt(WireType.len);
+                    const expected_len: u32 = (@as(u32, w.field_number) << 3) | @backingInt(WireType.len);
+                    const expected_grp: u32 = (@as(u32, w.field_number) << 3) | @backingInt(WireType.sgroup);
                     while (r.readRawTag() catch return 0) |raw_tag| {
-                        if (raw_tag == expected_raw) {
+                        if (raw_tag == expected_len) {
                             total += (r.readBytes() catch return 0).len;
+                        } else if (raw_tag == expected_grp) {
+                            total += (r.readGroupBytes(w.field_number, max_recursion_depth) catch return 0).len;
                         } else {
                             const tag = decodeTag(raw_tag) catch return 0;
                             r.skipField(tag, max_recursion_depth) catch return 0;
@@ -941,10 +965,13 @@ pub fn Lazy(comptime M: type) type {
                 .ptr => |p| try p.encode(w),
                 .wire => |wf| {
                     var r = Reader.init(wf.buf);
-                    const expected_raw: u32 = (@as(u32, wf.field_number) << 3) | @backingInt(WireType.len);
+                    const expected_len: u32 = (@as(u32, wf.field_number) << 3) | @backingInt(WireType.len);
+                    const expected_grp: u32 = (@as(u32, wf.field_number) << 3) | @backingInt(WireType.sgroup);
                     while (r.readRawTag() catch unreachable) |raw_tag| {
-                        if (raw_tag == expected_raw) {
+                        if (raw_tag == expected_len) {
                             try w.writeAll(r.readBytes() catch unreachable);
+                        } else if (raw_tag == expected_grp) {
+                            try w.writeAll(r.readGroupBytes(wf.field_number, max_recursion_depth) catch unreachable);
                         } else {
                             const tag = decodeTag(raw_tag) catch unreachable;
                             r.skipField(tag, max_recursion_depth) catch unreachable;
@@ -2531,4 +2558,172 @@ fn cloneValue(allocator: Allocator, val: anytype, depth: u32) CloneError!@TypeOf
         .bool, .int, .float, .@"enum", .void => return val,
         else => @compileError("unsupported type in wire.cloneMessage: " ++ @typeName(T)),
     }
+}
+
+/// Codec for Proto2 delimited `group` fields (`TAG(N, .sgroup) ... TAG(N, .egroup)`).
+/// Compatible with `wire.Repeated(wire.GroupCodec(GroupMsg, N))`.
+pub fn GroupCodec(comptime M: type, comptime field_number: u29) type {
+    @setEvalBranchQuota(100_000);
+    return struct {
+        pub const T = M;
+        pub const wire_type: WireType = .sgroup;
+        pub const is_packable: bool = false;
+        pub const is_message: bool = true;
+        pub const fixed_size: ?usize = null;
+        pub const default_value: T = .{};
+
+        pub inline fn isDefault(_: T) bool {
+            return false;
+        }
+
+        pub fn size(v: T) usize {
+            return v.encodedSize() + tagSize(field_number);
+        }
+
+        pub fn write(w: anytype, v: T) WriterError(@TypeOf(w))!void {
+            try v.encode(w);
+            try writeTag(w, field_number, .egroup);
+        }
+
+        pub fn writeReverse(rw: *ReverseWriter, v: T) EncodeError!void {
+            try rw.writeTag(field_number, .egroup);
+            try v.encodeReverse(rw);
+        }
+
+        pub fn read(r: *Reader, depth: u32) DecodeError!T {
+            const body = try r.readGroupBytes(field_number, depth);
+            return M.decodeDepth(body, depth);
+        }
+
+        pub fn mergeRead(dst: *T, r: *Reader, depth: u32) DecodeError!void {
+            const body = try r.readGroupBytes(field_number, depth);
+            try dst.mergeDepth(body, depth);
+        }
+
+        pub fn validate(r: *Reader, depth: u32) DecodeError!void {
+            const body = try r.readGroupBytes(field_number, depth);
+            try M.validateDepth(body, depth);
+        }
+    };
+}
+
+fn unknownFieldsOf(msg: anytype) *const UnknownFields {
+    const M = @typeInfo(@TypeOf(msg)).pointer.child;
+    if (comptime @hasField(M, "_unknown_fields")) return &msg._unknown_fields;
+    if (comptime @hasField(M, "_protoz_unknown_fields")) return &msg._protoz_unknown_fields;
+    @compileError(@typeName(M) ++ " was compiled without `preserve_unknown_fields = true`");
+}
+
+fn decodeUnknownPayload(comptime Codec: type, u: UnknownField) DecodeError!Codec.T {
+    if (comptime Codec.is_message) {
+        if (comptime Codec.wire_type == .sgroup) {
+            var er = Reader.init(u.bytes);
+            const body = try er.readGroupBytes(u.field_number, max_recursion_depth);
+            return Codec.T.decodeDepth(body, max_recursion_depth);
+        }
+        return Codec.T.decodeDepth(u.bytes, max_recursion_depth);
+    } else if (comptime Codec.wire_type == .len) {
+        if (comptime Codec == ScalarCodec(.string_utf8)) {
+            if (!std.unicode.utf8ValidateSlice(u.bytes)) return error.InvalidUtf8;
+        }
+        return u.bytes;
+    } else {
+        var er = Reader.init(u.bytes);
+        return Codec.read(&er, max_recursion_depth);
+    }
+}
+
+/// Zero-allocation typed Proto2 singular extension descriptor backed by `UnknownFields`.
+pub fn Extension(comptime Extendee: type, comptime field_number: u29, comptime Codec: type) type {
+    return struct {
+        pub const Host = Extendee;
+        pub const number: u29 = field_number;
+        pub const Value = Codec.T;
+
+        pub fn has(msg: *const Extendee) DecodeError!bool {
+            const uf = unknownFieldsOf(msg);
+            var it = uf.iterator(Extendee._protoz_known_fields);
+            while (try it.next()) |u| {
+                if (u.field_number == field_number) return true;
+            }
+            return false;
+        }
+
+        pub fn get(msg: *const Extendee) DecodeError!?Value {
+            const uf = unknownFieldsOf(msg);
+            var it = uf.iterator(Extendee._protoz_known_fields);
+            var found: ?Value = null;
+            while (try it.next()) |u| {
+                if (u.field_number != field_number) continue;
+                if (u.wire_type != Codec.wire_type) return error.WireTypeMismatch;
+                if (comptime Codec.is_message) {
+                    const body = if (comptime Codec.wire_type == .sgroup) blk: {
+                        var er = Reader.init(u.bytes);
+                        break :blk try er.readGroupBytes(field_number, max_recursion_depth);
+                    } else u.bytes;
+                    if (found) |*existing| {
+                        try existing.mergeDepth(body, max_recursion_depth);
+                    } else {
+                        found = try Codec.T.decodeDepth(body, max_recursion_depth);
+                    }
+                } else {
+                    found = try decodeUnknownPayload(Codec, u);
+                }
+            }
+            return found;
+        }
+
+        pub fn encodeSlice(val: Value, buf: []u8) EncodeError![]const u8 {
+            var rw = ReverseWriter.init(buf);
+            try Codec.writeReverse(&rw, val);
+            try rw.writeTag(field_number, Codec.wire_type);
+            return rw.written();
+        }
+    };
+}
+
+/// Zero-allocation typed Proto2 repeated extension descriptor backed by `UnknownFields`.
+pub fn RepeatedExtension(comptime Extendee: type, comptime field_number: u29, comptime Codec: type) type {
+    return struct {
+        pub const Host = Extendee;
+        pub const number: u29 = field_number;
+        pub const Value = Codec.T;
+
+        pub const Iterator = struct {
+            base: UnknownFields.Iterator(Extendee._protoz_known_fields),
+            packed_reader: ?Reader = null,
+
+            pub fn next(self: *@This()) DecodeError!?Value {
+                while (true) {
+                    if (self.packed_reader) |*pr| {
+                        if (!pr.eof()) return try Codec.read(pr, max_recursion_depth);
+                        self.packed_reader = null;
+                    }
+                    const u = (try self.base.next()) orelse return null;
+                    if (u.field_number != field_number) continue;
+                    if (u.wire_type == Codec.wire_type) {
+                        return try decodeUnknownPayload(Codec, u);
+                    }
+                    if (comptime Codec.is_packable) {
+                        if (u.wire_type == .len) {
+                            self.packed_reader = Reader.init(u.bytes);
+                            continue;
+                        }
+                    }
+                    return error.WireTypeMismatch;
+                }
+            }
+        };
+
+        pub inline fn iterator(msg: *const Extendee) Iterator {
+            return .{ .base = unknownFieldsOf(msg).iterator(Extendee._protoz_known_fields) };
+        }
+
+        pub fn encodeSlice(items: []const Value, comptime pack: bool, buf: []u8) EncodeError![]const u8 {
+            const rep: Repeated(Codec) = .{ .slice = items };
+            var rw = ReverseWriter.init(buf);
+            try rep.encodeReverse(field_number, pack, &rw);
+            return rw.written();
+        }
+    };
 }

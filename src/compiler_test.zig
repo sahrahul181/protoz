@@ -1329,3 +1329,346 @@ test "protoz: public facade exports compile cleanly alongside generated .pb.zig"
     try std.testing.expectEqual(@as(u64, 7), decoded.msg.id);
     try std.testing.expectEqualStrings("facade", decoded.msg.source);
 }
+
+test "codegen: escapes Zig primitive names in declarations, fields, and import public" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var f_base = try parser.Parser.parse(arena,
+        \\syntax = "proto3";
+        \\package stress.base;
+        \\enum u8 { U8_ZERO = 0; }
+        \\message type {
+        \\  bool bool = 1;
+        \\  uint32 usize = 2;
+        \\  u8 u01 = 3;
+        \\  int32 _ = 4;
+        \\}
+    );
+    f_base.name = "base.proto";
+
+    var f_reexport = try parser.Parser.parse(arena,
+        \\syntax = "proto3";
+        \\import public "base.proto";
+        \\message Holder { stress.base.type item = 1; }
+    );
+    f_reexport.name = "reexport.proto";
+
+    const files = [_]ast.File{ f_base, f_reexport };
+    const res = try resolver.Resolver.buildMulti(arena, &files);
+
+    var base_out: std.Io.Writer.Allocating = .init(arena);
+    try codegen.generateFile(arena, 0, &res, &base_out.writer);
+    const base_gen = base_out.written();
+
+    try std.testing.expect(std.mem.indexOf(u8, base_gen, "pub const @\"u8\" = enum(i32) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, base_gen, "pub const @\"type\" = struct {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, base_gen, "@\"bool\": bool = false,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, base_gen, "@\"usize\": u32 = 0,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, base_gen, "@\"u01\": @\"u8\" = @fromBackingInt(0),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, base_gen, "@\"_\": i32 = 0,") != null);
+
+    var re_out: std.Io.Writer.Allocating = .init(arena);
+    try codegen.generateFile(arena, 1, &res, &re_out.writer);
+    const re_gen = re_out.written();
+
+    try std.testing.expect(std.mem.indexOf(u8, re_gen, "pub const @\"type\" = _imp_0.@\"type\";") != null);
+    try std.testing.expect(std.mem.indexOf(u8, re_gen, "item: ?_imp_0.@\"type\" = null,") != null);
+}
+
+test "codegen: avoids file-scope wire and _protoz_file alias collisions" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const file = try parser.Parser.parse(arena,
+        \\syntax = "proto3";
+        \\package pkg;
+        \\message wire { string x = 1; }
+        \\message _protoz_file {
+        \\  message wire { int32 y = 1; }
+        \\  .pkg.wire outer_wire = 1;
+        \\}
+    );
+    const res = try resolver.Resolver.build(arena, &file);
+
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try codegen.generateFile(arena, 0, &res, &out.writer);
+    const gen = out.written();
+
+    try std.testing.expect(std.mem.indexOf(u8, gen, "const _protoz_wire = @import(\"proto_wire\");") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "const _protoz_self = @This();") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub const wire = struct {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "outer_wire: ?_protoz_self.wire = null,") != null);
+}
+
+test "proto2: parser, resolver, and codegen materialize groups, extension ranges, and extend" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const src =
+        \\syntax = "proto2";
+        \\package legacy.v1;
+        \\message Envelope {
+        \\  optional group Header = 1 {
+        \\    required string key = 1;
+        \\    optional int32 priority = 2 [default = 5];
+        \\  }
+        \\  repeated group Tag = 2 {
+        \\    optional string label = 1;
+        \\  }
+        \\  extensions 100 to 199;
+        \\  extend Envelope {
+        \\    optional uint64 nested_ext = 105;
+        \\  }
+        \\}
+        \\extend Envelope {
+        \\  optional string note = 100;
+        \\  repeated int32 ids = 101;
+        \\  optional group Audit = 102 {
+        \\    optional int64 ts = 1;
+        \\  }
+        \\}
+    ;
+
+    const file = try parser.Parser.parse(arena, src);
+    const res = try resolver.Resolver.build(arena, &file);
+
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try codegen.generateFileWithOptions(arena, 0, &res, &out.writer, .{ .preserve_unknown_fields = true });
+    const gen = out.written();
+
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub const Header = struct {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "header: ?Envelope.Header = null,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "tag: wire.Repeated(wire.GroupCodec(Envelope.Tag, 2)) = .empty,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "try wire.writeTag(w, 1, .sgroup);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "try wire.writeTag(w, 1, .egroup);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub const nested_ext = wire.Extension(Envelope, 105, wire.ScalarCodec(.uint64));") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub const note = wire.Extension(Envelope, 100, wire.ScalarCodec(.string));") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub const ids = wire.RepeatedExtension(Envelope, 101, wire.ScalarCodec(.int32));") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub const audit = wire.Extension(Envelope, 102, wire.GroupCodec(Audit, 102));") != null);
+
+    // Reject extension number outside declared `extensions` range
+    const bad =
+        \\syntax = "proto2";
+        \\message Host { extensions 100 to 110; }
+        \\extend Host { optional int32 oob = 200; }
+    ;
+    const bad_file = try parser.Parser.parse(arena, bad);
+    try std.testing.expectError(error.ExtensionNumberOutOfRange, resolver.Resolver.build(arena, &bad_file));
+}
+
+test "wire: GroupCodec, Extension, and RepeatedExtension round-trip with zero allocations" {
+    const Host = struct {
+        id: u64 = 0,
+        _unknown_fields: wire.UnknownFields = .empty,
+        pub const _protoz_known_fields: []const u29 = &.{1};
+    };
+
+    const ExtNote = wire.Extension(Host, 100, wire.ScalarCodec(.string));
+    const ExtIds = wire.RepeatedExtension(Host, 101, wire.ScalarCodec(.int32));
+    const ExtGroup = wire.Extension(Host, 102, wire.GroupCodec(pb.SmallEvent, 102));
+
+    var raw_buf: [256]u8 = undefined;
+    var sw = wire.SliceWriter.init(&raw_buf);
+
+    var tmp: [128]u8 = undefined;
+    try sw.writeAll(try ExtNote.encodeSlice("proto2-ext", &tmp));
+    try sw.writeAll(try ExtIds.encodeSlice(&.{ 7, 11, 13 }, true, &tmp));
+    try sw.writeAll(try ExtGroup.encodeSlice(.{ .id = 55, .source = "grp" }, &tmp));
+
+    const host = Host{
+        .id = 1,
+        ._unknown_fields = .{ .raw = sw.written() },
+    };
+
+    try std.testing.expect(try ExtNote.has(&host));
+    try std.testing.expectEqualStrings("proto2-ext", (try ExtNote.get(&host)).?);
+
+    var id_it = ExtIds.iterator(&host);
+    try std.testing.expectEqual(@as(?i32, 7), try id_it.next());
+    try std.testing.expectEqual(@as(?i32, 11), try id_it.next());
+    try std.testing.expectEqual(@as(?i32, 13), try id_it.next());
+    try std.testing.expectEqual(@as(?i32, null), try id_it.next());
+
+    const grp = (try ExtGroup.get(&host)).?;
+    try std.testing.expectEqual(@as(u64, 55), grp.id);
+    try std.testing.expectEqualStrings("grp", grp.source);
+}
+
+fn writeDescriptorField(
+    arena: std.mem.Allocator,
+    opts: struct {
+        name: []const u8,
+        extendee: []const u8 = "",
+        number: u29,
+        label: u32,
+        type_enum: u32,
+        type_name: []const u8 = "",
+        default_value: ?[]const u8 = null,
+    },
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    const w = &out.writer;
+    try wire.writeTag(w, 1, .len);
+    try wire.writeBytes(w, opts.name);
+    if (opts.extendee.len > 0) {
+        try wire.writeTag(w, 2, .len);
+        try wire.writeBytes(w, opts.extendee);
+    }
+    try wire.writeTag(w, 3, .varint);
+    try wire.writeVarint(w, opts.number);
+    try wire.writeTag(w, 4, .varint);
+    try wire.writeVarint(w, opts.label);
+    try wire.writeTag(w, 5, .varint);
+    try wire.writeVarint(w, opts.type_enum);
+    if (opts.type_name.len > 0) {
+        try wire.writeTag(w, 6, .len);
+        try wire.writeBytes(w, opts.type_name);
+    }
+    if (opts.default_value) |dv| {
+        try wire.writeTag(w, 7, .len);
+        try wire.writeBytes(w, dv);
+    }
+    return out.toOwnedSlice();
+}
+
+test "plugin: decodes CodeGeneratorRequest with TYPE_GROUP, extension_range, extension, and default_value" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Nested DescriptorProto: Header { required string key = 1; optional int32 retry = 2 [default = 5]; }
+    var header_desc: std.Io.Writer.Allocating = .init(arena);
+    {
+        const w = &header_desc.writer;
+        try wire.writeTag(w, 1, .len);
+        try wire.writeBytes(w, "Header");
+        try wire.writeTag(w, 2, .len);
+        try wire.writeBytes(w, try writeDescriptorField(arena, .{ .name = "key", .number = 1, .label = 2, .type_enum = 9 }));
+        try wire.writeTag(w, 2, .len);
+        try wire.writeBytes(w, try writeDescriptorField(arena, .{ .name = "retry", .number = 2, .label = 1, .type_enum = 5, .default_value = "5" }));
+    }
+
+    // Nested DescriptorProto: Audit { optional int64 ts = 1; }
+    var audit_desc: std.Io.Writer.Allocating = .init(arena);
+    {
+        const w = &audit_desc.writer;
+        try wire.writeTag(w, 1, .len);
+        try wire.writeBytes(w, "Audit");
+        try wire.writeTag(w, 2, .len);
+        try wire.writeBytes(w, try writeDescriptorField(arena, .{ .name = "ts", .number = 1, .label = 1, .type_enum = 3 }));
+    }
+
+    // Envelope DescriptorProto with TYPE_GROUP field, ExtensionRange [100, 200), and nested extension
+    var env_desc: std.Io.Writer.Allocating = .init(arena);
+    {
+        const w = &env_desc.writer;
+        try wire.writeTag(w, 1, .len);
+        try wire.writeBytes(w, "Envelope");
+        try wire.writeTag(w, 2, .len);
+        try wire.writeBytes(w, try writeDescriptorField(arena, .{
+            .name = "header",
+            .number = 1,
+            .label = 1,
+            .type_enum = 10, // TYPE_GROUP
+            .type_name = ".legacy.v1.Envelope.Header",
+        }));
+        try wire.writeTag(w, 3, .len);
+        try wire.writeBytes(w, header_desc.written());
+        try wire.writeTag(w, 3, .len);
+        try wire.writeBytes(w, audit_desc.written());
+
+        // ExtensionRange: start = 100 (inclusive), end = 200 (exclusive -> 199)
+        var er: std.Io.Writer.Allocating = .init(arena);
+        try wire.writeTag(&er.writer, 1, .varint);
+        try wire.writeVarint(&er.writer, 100);
+        try wire.writeTag(&er.writer, 2, .varint);
+        try wire.writeVarint(&er.writer, 200);
+        try wire.writeTag(w, 5, .len);
+        try wire.writeBytes(w, er.written());
+
+        // Nested extension (DescriptorProto.extension = 6)
+        try wire.writeTag(w, 6, .len);
+        try wire.writeBytes(w, try writeDescriptorField(arena, .{
+            .name = "nested_ext",
+            .extendee = ".legacy.v1.Envelope",
+            .number = 105,
+            .label = 1,
+            .type_enum = 4, // UINT64
+        }));
+    }
+
+    // FileDescriptorProto: legacy/ext.proto
+    var fd: std.Io.Writer.Allocating = .init(arena);
+    {
+        const w = &fd.writer;
+        try wire.writeTag(w, 1, .len);
+        try wire.writeBytes(w, "legacy/ext.proto");
+        try wire.writeTag(w, 2, .len);
+        try wire.writeBytes(w, "legacy.v1");
+        try wire.writeTag(w, 4, .len);
+        try wire.writeBytes(w, env_desc.written());
+        // File-level extensions (FileDescriptorProto.extension = 7)
+        try wire.writeTag(w, 7, .len);
+        try wire.writeBytes(w, try writeDescriptorField(arena, .{
+            .name = "note",
+            .extendee = ".legacy.v1.Envelope",
+            .number = 100,
+            .label = 1,
+            .type_enum = 9, // STRING
+        }));
+        try wire.writeTag(w, 7, .len);
+        try wire.writeBytes(w, try writeDescriptorField(arena, .{
+            .name = "audit",
+            .extendee = ".legacy.v1.Envelope",
+            .number = 102,
+            .label = 1,
+            .type_enum = 10, // TYPE_GROUP
+            .type_name = ".legacy.v1.Envelope.Audit",
+        }));
+        try wire.writeTag(w, 12, .len);
+        try wire.writeBytes(w, "proto2");
+    }
+
+    var req: std.Io.Writer.Allocating = .init(arena);
+    try wire.writeTag(&req.writer, 1, .len);
+    try wire.writeBytes(&req.writer, "legacy/ext.proto");
+    try wire.writeTag(&req.writer, 2, .len);
+    try wire.writeBytes(&req.writer, "preserve_unknown_fields=true");
+    try wire.writeTag(&req.writer, 15, .len);
+    try wire.writeBytes(&req.writer, fd.written());
+
+    const resp = try plugin.processRequest(arena, req.written());
+    var r = wire.Reader.init(resp);
+    var gen_name: []const u8 = "";
+    var gen_content: []const u8 = "";
+    while (try r.readTag()) |tag| {
+        switch (tag.field_number) {
+            1 => return error.UnexpectedPluginError,
+            15 => {
+                var fr = wire.Reader.init(try r.readBytes());
+                while (try fr.readTag()) |ft| {
+                    switch (ft.field_number) {
+                        1 => gen_name = try fr.readBytes(),
+                        15 => gen_content = try fr.readBytes(),
+                        else => try fr.skipField(ft, wire.max_recursion_depth),
+                    }
+                }
+            },
+            else => try r.skipField(tag, wire.max_recursion_depth),
+        }
+    }
+
+    try std.testing.expectEqualStrings("legacy/ext.pb.zig", gen_name);
+    try std.testing.expect(std.mem.indexOf(u8, gen_content, "pub const retry: i32 = 5;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen_content, "header: ?Envelope.Header = null,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen_content, "try wire.writeTag(w, 1, .sgroup);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen_content, "try wire.writeTag(w, 1, .egroup);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen_content, "return error.MissingRequiredField;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen_content, "pub const nested_ext = wire.Extension(Envelope, 105, wire.ScalarCodec(.uint64));") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen_content, "pub const note = wire.Extension(Envelope, 100, wire.ScalarCodec(.string));") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen_content, "pub const audit = wire.Extension(Envelope, 102, wire.GroupCodec(Envelope.Audit, 102));") != null);
+}

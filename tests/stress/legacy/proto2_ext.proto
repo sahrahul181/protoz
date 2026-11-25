@@ -1,0 +1,61 @@
+syntax = "proto2";
+package stress.legacy;
+
+enum LegacyMode {
+  MODE_ALPHA = 1;
+  MODE_BETA = 2;
+}
+
+message LegacyRecord {
+  required uint64 required_id = 1;
+  optional int32 retry_limit = 2 [default = 5];
+  optional string region = 3 [default = "us-east"];
+  optional LegacyMode mode = 4 [default = MODE_BETA];
+  repeated uint32 unpacked_ids = 5;
+  repeated uint32 packed_ids = 6 [packed = true];
+  optional string old_note = 7 [deprecated = true];
+
+  optional group LegacyGroup = 10 {
+    optional int32 a = 1;
+    optional string b = 2;
+  }
+
+  repeated group LegacyTag = 11 {
+    optional string tag = 1;
+  }
+
+  oneof choice {
+    string text_choice = 12;
+    group GroupChoice = 13 {
+      optional int32 code = 1;
+      optional string msg = 2;
+    }
+  }
+
+  reserved 50 to 60, 77;
+  reserved "retired_field";
+
+  extensions 100 to 199;
+}
+
+message CyclicGroupNode {
+  optional int32 val = 1;
+  optional group Next = 2 {
+    optional CyclicGroupNode target = 1;
+    optional string note = 2;
+  }
+}
+
+extend LegacyRecord {
+  optional string ext_tag = 100;
+  repeated uint32 ext_nums = 101;
+}
+
+message LegacyParent {
+  optional LegacyRecord opt_rec = 1;
+  repeated LegacyRecord rep_recs = 2;
+  map<string, LegacyRecord> map_recs = 3;
+  oneof pick {
+    LegacyRecord oneof_rec = 4;
+  }
+}

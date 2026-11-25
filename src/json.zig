@@ -66,12 +66,30 @@ pub const DecodeError = wire.Allocator.Error || wkt.WktError || error{
 // ---------------------------------------------------------------------------
 
 pub fn encodeMessage(msg: anytype, w: anytype, opts: EncodeOptions) EncodeError(@TypeOf(w))!void {
-    return encodeMessageDepth(msg, w, opts, wire.max_recursion_depth);
+    return encodeMessageWithTypes(msg, w, opts, .{});
+}
+
+pub fn encodeMessageWithTypes(
+    msg: anytype,
+    w: anytype,
+    opts: EncodeOptions,
+    comptime known_types: anytype,
+) EncodeError(@TypeOf(w))!void {
+    return encodeMessageDepth(msg, w, opts, wire.max_recursion_depth, known_types);
 }
 
 pub fn encodeMessageSlice(msg: anytype, buf: []u8, opts: EncodeOptions) SliceEncodeError![]const u8 {
+    return encodeMessageSliceWithTypes(msg, buf, opts, .{});
+}
+
+pub fn encodeMessageSliceWithTypes(
+    msg: anytype,
+    buf: []u8,
+    opts: EncodeOptions,
+    comptime known_types: anytype,
+) SliceEncodeError![]const u8 {
     var sw = wire.SliceWriter.init(buf);
-    try encodeMessage(msg, &sw, opts);
+    try encodeMessageWithTypes(msg, &sw, opts, known_types);
     return sw.written();
 }
 
@@ -81,8 +99,18 @@ pub fn decodeMessage(
     input: []const u8,
     opts: DecodeOptions,
 ) DecodeError!M {
+    return decodeMessageWithTypes(M, arena, input, opts, .{});
+}
+
+pub fn decodeMessageWithTypes(
+    comptime M: type,
+    arena: wire.Allocator,
+    input: []const u8,
+    opts: DecodeOptions,
+    comptime known_types: anytype,
+) DecodeError!M {
     var p = JsonParser{ .input = input };
-    const out = try decodeMessageDepth(M, arena, &p, opts, opts.max_depth);
+    const out = try decodeMessageDepth(M, arena, &p, opts, opts.max_depth, known_types);
     p.skipWs();
     if (!p.eof()) return error.TrailingTokens;
     return out;
@@ -132,15 +160,16 @@ fn encodeMessageDepth(
     w: anytype,
     opts: EncodeOptions,
     depth: u32,
+    comptime known_types: anytype,
 ) EncodeError(@TypeOf(w))!void {
     @setEvalBranchQuota(100_000);
     if (depth == 0) return error.RecursionLimitExceeded;
     const M = @TypeOf(msg);
 
     if (comptime @hasDecl(M, "proto_full_name") and isSpecialWkt(M.proto_full_name)) {
-        try encodeSpecialWkt(msg, w, opts, depth);
+        try encodeSpecialWkt(msg, w, opts, depth, known_types);
     } else {
-        try encodeObject(msg, w, opts, depth);
+        try encodeObject(msg, w, opts, depth, known_types);
     }
 }
 
@@ -149,6 +178,7 @@ fn encodeSpecialWkt(
     w: anytype,
     opts: EncodeOptions,
     depth: u32,
+    comptime known_types: anytype,
 ) EncodeError(@TypeOf(w))!void {
     const M = @TypeOf(msg);
     const full = M.proto_full_name;
@@ -182,6 +212,22 @@ fn encodeSpecialWkt(
             try w.writeAll("{}");
             return;
         }
+        inline for (known_types) |KnownM| {
+            if (wkt.anyIs(msg, KnownM)) {
+                const sub = try KnownM.decodeDepth(msg.value, depth - 1);
+                try w.writeAll("{\"@type\":");
+                try writeJsonString(w, msg.type_url);
+                if (comptime @hasDecl(KnownM, "proto_full_name") and isSpecialWkt(KnownM.proto_full_name)) {
+                    try w.writeAll(",\"value\":");
+                    try encodeSpecialWkt(sub, w, opts, depth - 1, known_types);
+                } else {
+                    var first = false;
+                    try encodeObjectFields(sub, w, opts, depth - 1, known_types, &first);
+                }
+                try w.writeByte('}');
+                return;
+            }
+        }
         try w.writeAll("{\"@type\":");
         try writeJsonString(w, msg.type_url);
         if (msg.value.len > 0 or opts.emit_default_values) {
@@ -197,7 +243,7 @@ fn encodeSpecialWkt(
             if (!first) try w.writeByte(',');
             try writeJsonString(w, entry.key);
             try w.writeByte(':');
-            try encodeMessageDepth(entry.value, w, opts, depth - 1);
+            try encodeMessageDepth(entry.value, w, opts, depth - 1, known_types);
             first = false;
         }
         try w.writeByte('}');
@@ -207,7 +253,7 @@ fn encodeSpecialWkt(
         var first = true;
         while (try it.next()) |item| {
             if (!first) try w.writeByte(',');
-            try encodeMessageDepth(item, w, opts, depth - 1);
+            try encodeMessageDepth(item, w, opts, depth - 1, known_types);
             first = false;
         }
         try w.writeByte(']');
@@ -218,8 +264,8 @@ fn encodeSpecialWkt(
                 .number_value => |n| try encodeScalar(n, false, w),
                 .string_value => |s| try writeJsonString(w, s),
                 .bool_value => |b| try w.writeAll(if (b) "true" else "false"),
-                .struct_value => |sv| try encodeMaybeLazy(sv, w, opts, depth - 1),
-                .list_value => |lv| try encodeMaybeLazy(lv, w, opts, depth - 1),
+                .struct_value => |sv| try encodeMaybeLazy(sv, w, opts, depth - 1, known_types),
+                .list_value => |lv| try encodeMaybeLazy(lv, w, opts, depth - 1, known_types),
             }
         } else {
             try w.writeAll("null");
@@ -233,13 +279,19 @@ fn encodeSpecialWkt(
     }
 }
 
-fn encodeMaybeLazy(val: anytype, w: anytype, opts: EncodeOptions, depth: u32) EncodeError(@TypeOf(w))!void {
+fn encodeMaybeLazy(
+    val: anytype,
+    w: anytype,
+    opts: EncodeOptions,
+    depth: u32,
+    comptime known_types: anytype,
+) EncodeError(@TypeOf(w))!void {
     const T = @TypeOf(val);
     if (comptime @typeInfo(T) == .@"union" and @hasDecl(T, "_protoz_kind") and T._protoz_kind == .lazy) {
         const sub = try val.decodeDepth(depth);
-        try encodeMessageDepth(sub, w, opts, depth);
+        try encodeMessageDepth(sub, w, opts, depth, known_types);
     } else {
-        try encodeMessageDepth(val, w, opts, depth);
+        try encodeMessageDepth(val, w, opts, depth, known_types);
     }
 }
 
@@ -248,10 +300,23 @@ fn encodeObject(
     w: anytype,
     opts: EncodeOptions,
     depth: u32,
+    comptime known_types: anytype,
 ) EncodeError(@TypeOf(w))!void {
-    const M = @TypeOf(msg);
     try w.writeByte('{');
     var first = true;
+    try encodeObjectFields(msg, w, opts, depth, known_types, &first);
+    try w.writeByte('}');
+}
+
+fn encodeObjectFields(
+    msg: anytype,
+    w: anytype,
+    opts: EncodeOptions,
+    depth: u32,
+    comptime known_types: anytype,
+    first: *bool,
+) EncodeError(@TypeOf(w))!void {
+    const M = @TypeOf(msg);
 
     inline for (M._protoz_json_fields) |meta| {
         const key_name = if (opts.preserve_proto_field_names) meta.proto_name else meta.json_name;
@@ -259,13 +324,13 @@ fn encodeObject(
             .scalar => {
                 if (comptime meta.explicit_presence) {
                     if (@field(msg, meta.zig_name)) |v| {
-                        try writeFieldKey(w, &first, key_name);
+                        try writeFieldKey(w, first, key_name);
                         try encodeScalar(v, meta.is_bytes, w);
                     }
                 } else {
                     const v = @field(msg, meta.zig_name);
                     if (opts.emit_default_values or !isScalarDefault(v)) {
-                        try writeFieldKey(w, &first, key_name);
+                        try writeFieldKey(w, first, key_name);
                         try encodeScalar(v, meta.is_bytes, w);
                     }
                 }
@@ -273,41 +338,41 @@ fn encodeObject(
             .@"enum" => {
                 if (comptime meta.explicit_presence) {
                     if (@field(msg, meta.zig_name)) |v| {
-                        try writeFieldKey(w, &first, key_name);
+                        try writeFieldKey(w, first, key_name);
                         try encodeEnum(v, w, opts);
                     }
                 } else {
                     const v = @field(msg, meta.zig_name);
                     if (opts.emit_default_values or @backingInt(v) != 0) {
-                        try writeFieldKey(w, &first, key_name);
+                        try writeFieldKey(w, first, key_name);
                         try encodeEnum(v, w, opts);
                     }
                 }
             },
             .message => {
                 if (@field(msg, meta.zig_name)) |sub| {
-                    try writeFieldKey(w, &first, key_name);
-                    try encodeMessageDepth(sub, w, opts, depth - 1);
+                    try writeFieldKey(w, first, key_name);
+                    try encodeMessageDepth(sub, w, opts, depth - 1, known_types);
                 }
             },
             .lazy_message => {
                 if (@field(msg, meta.zig_name)) |lazy| {
                     const sub = try lazy.decodeDepth(depth);
-                    try writeFieldKey(w, &first, key_name);
-                    try encodeMessageDepth(sub, w, opts, depth - 1);
+                    try writeFieldKey(w, first, key_name);
+                    try encodeMessageDepth(sub, w, opts, depth - 1, known_types);
                 }
             },
             .repeated => {
                 var it = @field(msg, meta.zig_name).iterator();
                 const first_item = try it.next();
                 if (first_item != null or opts.emit_default_values) {
-                    try writeFieldKey(w, &first, key_name);
+                    try writeFieldKey(w, first, key_name);
                     try w.writeByte('[');
                     if (first_item) |item0| {
-                        try encodeElem(item0, meta.elem_is_bytes, w, opts, depth - 1);
+                        try encodeElem(item0, meta.elem_is_bytes, w, opts, depth - 1, known_types);
                         while (try it.next()) |item| {
                             try w.writeByte(',');
-                            try encodeElem(item, meta.elem_is_bytes, w, opts, depth - 1);
+                            try encodeElem(item, meta.elem_is_bytes, w, opts, depth - 1, known_types);
                         }
                     }
                     try w.writeByte(']');
@@ -317,17 +382,17 @@ fn encodeObject(
                 var it = @field(msg, meta.zig_name).iterator();
                 const first_entry = try it.next();
                 if (first_entry != null or opts.emit_default_values) {
-                    try writeFieldKey(w, &first, key_name);
+                    try writeFieldKey(w, first, key_name);
                     try w.writeByte('{');
                     if (first_entry) |e0| {
                         try encodeMapKey(e0.key, w);
                         try w.writeByte(':');
-                        try encodeElem(e0.value, meta.elem_is_bytes, w, opts, depth - 1);
+                        try encodeElem(e0.value, meta.elem_is_bytes, w, opts, depth - 1, known_types);
                         while (try it.next()) |entry| {
                             try w.writeByte(',');
                             try encodeMapKey(entry.key, w);
                             try w.writeByte(':');
-                            try encodeElem(entry.value, meta.elem_is_bytes, w, opts, depth - 1);
+                            try encodeElem(entry.value, meta.elem_is_bytes, w, opts, depth - 1, known_types);
                         }
                     }
                     try w.writeByte('}');
@@ -338,12 +403,12 @@ fn encodeObject(
                     switch (u) {
                         inline else => |payload, tag| {
                             if (comptime std.mem.eql(u8, @tagName(tag), meta.zig_name)) {
-                                try writeFieldKey(w, &first, key_name);
+                                try writeFieldKey(w, first, key_name);
                                 if (comptime meta.is_lazy) {
                                     const sub = try payload.decodeDepth(depth);
-                                    try encodeMessageDepth(sub, w, opts, depth - 1);
+                                    try encodeMessageDepth(sub, w, opts, depth - 1, known_types);
                                 } else {
-                                    try encodeElem(payload, meta.is_bytes, w, opts, depth - 1);
+                                    try encodeElem(payload, meta.is_bytes, w, opts, depth - 1, known_types);
                                 }
                             }
                         },
@@ -352,8 +417,6 @@ fn encodeObject(
             },
         }
     }
-
-    try w.writeByte('}');
 }
 
 fn encodeElem(
@@ -362,10 +425,11 @@ fn encodeElem(
     w: anytype,
     opts: EncodeOptions,
     depth: u32,
+    comptime known_types: anytype,
 ) EncodeError(@TypeOf(w))!void {
     const T = @TypeOf(val);
     if (comptime @typeInfo(T) == .@"struct" and @hasDecl(T, "_protoz_json_fields")) {
-        try encodeMessageDepth(val, w, opts, depth);
+        try encodeMessageDepth(val, w, opts, depth, known_types);
     } else if (comptime @typeInfo(T) == .@"enum") {
         try encodeEnum(val, w, opts);
     } else {
@@ -791,14 +855,63 @@ fn decodeMessageDepth(
     p: *JsonParser,
     opts: DecodeOptions,
     depth: u32,
+    comptime known_types: anytype,
 ) DecodeError!M {
     @setEvalBranchQuota(100_000);
     if (depth == 0) return error.RecursionLimitExceeded;
 
     if (comptime @hasDecl(M, "proto_full_name") and isSpecialWkt(M.proto_full_name)) {
-        return decodeSpecialWkt(M, arena, p, opts, depth);
+        return decodeSpecialWkt(M, arena, p, opts, depth, known_types);
     } else {
-        return decodeObject(M, arena, p, opts, depth);
+        return decodeObject(M, arena, p, opts, depth, known_types);
+    }
+}
+
+fn peekAnyTypeUrl(arena: wire.Allocator, p: *JsonParser, depth: u32) DecodeError!?[]const u8 {
+    try p.expectByte('{');
+    if (p.consumeByte('}')) return null;
+    while (true) {
+        const key = try p.parseStringSlice(arena);
+        try p.expectByte(':');
+        if (std.mem.eql(u8, key, "@type")) {
+            if (p.consumeLiteral("null")) return null;
+            return try p.parseStringSlice(arena);
+        }
+        try p.skipValue(depth);
+        if (p.consumeByte(',')) continue;
+        try p.expectByte('}');
+        return null;
+    }
+}
+
+fn decodeAnyWrappedWkt(
+    comptime KnownM: type,
+    arena: wire.Allocator,
+    p: *JsonParser,
+    opts: DecodeOptions,
+    depth: u32,
+    comptime known_types: anytype,
+) DecodeError!KnownM {
+    var out: KnownM = .{};
+    try p.expectByte('{');
+    if (p.consumeByte('}')) return out;
+    while (true) {
+        const key = try p.parseStringSlice(arena);
+        try p.expectByte(':');
+        if (std.mem.eql(u8, key, "@type")) {
+            if (!p.consumeLiteral("null")) _ = try p.parseStringSlice(arena);
+        } else if (std.mem.eql(u8, key, "value")) {
+            if (!p.consumeLiteral("null")) {
+                out = try decodeSpecialWkt(KnownM, arena, p, opts, depth, known_types);
+            }
+        } else if (opts.ignore_unknown_fields) {
+            try p.skipValue(depth);
+        } else {
+            return error.UnknownField;
+        }
+        if (p.consumeByte(',')) continue;
+        try p.expectByte('}');
+        return out;
     }
 }
 
@@ -808,6 +921,7 @@ fn decodeSpecialWkt(
     p: *JsonParser,
     opts: DecodeOptions,
     depth: u32,
+    comptime known_types: anytype,
 ) DecodeError!M {
     const full = M.proto_full_name;
 
@@ -840,6 +954,34 @@ fn decodeSpecialWkt(
         }
         return .{ .paths = .{ .slice = try list.toOwnedSlice(arena) } };
     } else if (comptime std.mem.eql(u8, full, "google.protobuf.Any")) {
+        if (comptime @typeInfo(@TypeOf(known_types)).@"struct".field_names.len > 0) {
+            p.skipWs();
+            const obj_start = p.pos;
+            var probe = p.*;
+            const type_url = try peekAnyTypeUrl(arena, &probe, depth - 1);
+            if (type_url) |url| {
+                const type_name = wkt.anyTypeName(url) orelse "";
+                inline for (known_types) |KnownM| {
+                    if (comptime @hasDecl(KnownM, "proto_full_name")) {
+                        if (std.mem.eql(u8, type_name, KnownM.proto_full_name)) {
+                            p.pos = obj_start;
+                            const sub: KnownM = if (comptime isSpecialWkt(KnownM.proto_full_name))
+                                try decodeAnyWrappedWkt(KnownM, arena, p, opts, depth - 1, known_types)
+                            else
+                                try decodeObjectInner(KnownM, arena, p, opts, depth - 1, known_types, true);
+
+                            const sz = sub.encodedSize();
+                            const buf = if (sz == 0) "" else blk: {
+                                const dst = try arena.alloc(u8, sz);
+                                break :blk sub.encodeSlice(dst) catch unreachable;
+                            };
+                            return .{ .type_url = url, .value = buf };
+                        }
+                    }
+                }
+            }
+            p.pos = obj_start;
+        }
         var out: M = .{};
         try p.expectByte('{');
         if (p.consumeByte('}')) return out;
@@ -871,7 +1013,7 @@ fn decodeSpecialWkt(
         while (true) {
             const k = try p.parseStringSlice(arena);
             try p.expectByte(':');
-            const v = try decodeMessageDepth(ValM, arena, p, opts, depth - 1);
+            const v = try decodeMessageDepth(ValM, arena, p, opts, depth - 1, known_types);
             try list.append(arena, .{ .key = k, .value = v });
             if (p.consumeByte(',')) continue;
             try p.expectByte('}');
@@ -884,7 +1026,7 @@ fn decodeSpecialWkt(
         if (p.consumeByte(']')) return .{ .values = .empty };
         var list: std.ArrayList(ValM) = .empty;
         while (true) {
-            try list.append(arena, try decodeMessageDepth(ValM, arena, p, opts, depth - 1));
+            try list.append(arena, try decodeMessageDepth(ValM, arena, p, opts, depth - 1, known_types));
             if (p.consumeByte(',')) continue;
             try p.expectByte(']');
             return .{ .values = .{ .slice = try list.toOwnedSlice(arena) } };
@@ -903,11 +1045,11 @@ fn decodeSpecialWkt(
             '-', '0'...'9' => .{ .kind = .{ .number_value = try decodeScalar(f64, false, arena, p) } },
             '{' => {
                 const FieldT = @FieldType(UnionT, "struct_value");
-                return .{ .kind = .{ .struct_value = try decodeMaybeLazy(FieldT, arena, p, opts, depth - 1) } };
+                return .{ .kind = .{ .struct_value = try decodeMaybeLazy(FieldT, arena, p, opts, depth - 1, known_types) } };
             },
             '[' => {
                 const FieldT = @FieldType(UnionT, "list_value");
-                return .{ .kind = .{ .list_value = try decodeMaybeLazy(FieldT, arena, p, opts, depth - 1) } };
+                return .{ .kind = .{ .list_value = try decodeMaybeLazy(FieldT, arena, p, opts, depth - 1, known_types) } };
             },
             else => error.InvalidJson,
         };
@@ -925,15 +1067,16 @@ fn decodeMaybeLazy(
     p: *JsonParser,
     opts: DecodeOptions,
     depth: u32,
+    comptime known_types: anytype,
 ) DecodeError!T {
     if (comptime @typeInfo(T) == .@"union" and @hasDecl(T, "_protoz_kind") and T._protoz_kind == .lazy) {
         const SubM = @typeInfo(@FieldType(T, "ptr")).pointer.child;
-        const sub = try decodeMessageDepth(SubM, arena, p, opts, depth);
+        const sub = try decodeMessageDepth(SubM, arena, p, opts, depth, known_types);
         const ptr = try arena.create(SubM);
         ptr.* = sub;
         return .{ .ptr = ptr };
     } else {
-        return decodeMessageDepth(T, arena, p, opts, depth);
+        return decodeMessageDepth(T, arena, p, opts, depth, known_types);
     }
 }
 
@@ -943,6 +1086,19 @@ fn decodeObject(
     p: *JsonParser,
     opts: DecodeOptions,
     depth: u32,
+    comptime known_types: anytype,
+) DecodeError!M {
+    return decodeObjectInner(M, arena, p, opts, depth, known_types, false);
+}
+
+fn decodeObjectInner(
+    comptime M: type,
+    arena: wire.Allocator,
+    p: *JsonParser,
+    opts: DecodeOptions,
+    depth: u32,
+    comptime known_types: anytype,
+    comptime skip_at_type: bool,
 ) DecodeError!M {
     var out: M = .{};
     try p.expectByte('{');
@@ -987,14 +1143,14 @@ fn decodeObject(
                                 @field(out, meta.zig_name) = .{ .kind = .{ .null_value = @fromBackingInt(0) } };
                             }
                         } else {
-                            @field(out, meta.zig_name) = try decodeMessageDepth(SubM, arena, p, opts, depth - 1);
+                            @field(out, meta.zig_name) = try decodeMessageDepth(SubM, arena, p, opts, depth - 1, known_types);
                         }
                     },
                     .lazy_message => {
                         if (!p.consumeLiteral("null")) {
                             const LazyT = @typeInfo(@FieldType(M, meta.zig_name)).optional.child;
                             const SubM = @typeInfo(@FieldType(LazyT, "ptr")).pointer.child;
-                            const sub = try decodeMessageDepth(SubM, arena, p, opts, depth - 1);
+                            const sub = try decodeMessageDepth(SubM, arena, p, opts, depth - 1, known_types);
                             const ptr = try arena.create(SubM);
                             ptr.* = sub;
                             @field(out, meta.zig_name) = .{ .ptr = ptr };
@@ -1010,7 +1166,7 @@ fn decodeObject(
                             } else {
                                 var list: std.ArrayList(ElemT) = .empty;
                                 while (true) {
-                                    if (try decodeElemOpt(ElemT, meta.elem_is_bytes, arena, p, opts, depth - 1)) |item| {
+                                    if (try decodeElemOpt(ElemT, meta.elem_is_bytes, arena, p, opts, depth - 1, known_types)) |item| {
                                         try list.append(arena, item);
                                     }
                                     if (p.consumeByte(',')) continue;
@@ -1036,7 +1192,7 @@ fn decodeObject(
                                     const raw_k = try p.parseStringSlice(arena);
                                     try p.expectByte(':');
                                     const mk = try decodeMapKey(KeyT, raw_k);
-                                    const mv = (try decodeElemOpt(ValT, meta.elem_is_bytes, arena, p, opts, depth - 1)) orelse return error.InvalidJson;
+                                    const mv = (try decodeElemOpt(ValT, meta.elem_is_bytes, arena, p, opts, depth - 1, known_types)) orelse return error.InvalidJson;
                                     try list.append(arena, .{ .key = mk, .value = mv });
                                     if (p.consumeByte(',')) continue;
                                     try p.expectByte('}');
@@ -1053,19 +1209,26 @@ fn decodeObject(
                             if (comptime meta.is_lazy) {
                                 const LazyT = @FieldType(UnionT, meta.zig_name);
                                 const SubM = @typeInfo(@FieldType(LazyT, "ptr")).pointer.child;
-                                const sub = try decodeMessageDepth(SubM, arena, p, opts, depth - 1);
+                                const sub = try decodeMessageDepth(SubM, arena, p, opts, depth - 1, known_types);
                                 const ptr = try arena.create(SubM);
                                 ptr.* = sub;
                                 @field(out, meta.oneof_field) = @unionInit(UnionT, meta.zig_name, .{ .ptr = ptr });
                             } else {
                                 const PayloadT = @FieldType(UnionT, meta.zig_name);
-                                if (try decodeElemOpt(PayloadT, meta.is_bytes, arena, p, opts, depth - 1)) |payload| {
+                                if (try decodeElemOpt(PayloadT, meta.is_bytes, arena, p, opts, depth - 1, known_types)) |payload| {
                                     @field(out, meta.oneof_field) = @unionInit(UnionT, meta.zig_name, payload);
                                 }
                             }
                         }
                     },
                 }
+            }
+        }
+
+        if (!matched and comptime skip_at_type) {
+            if (std.mem.eql(u8, key, "@type")) {
+                if (!p.consumeLiteral("null")) _ = try p.parseStringSlice(arena);
+                matched = true;
             }
         }
 
@@ -1087,9 +1250,10 @@ fn decodeElemOpt(
     p: *JsonParser,
     opts: DecodeOptions,
     depth: u32,
+    comptime known_types: anytype,
 ) DecodeError!?T {
     if (comptime @typeInfo(T) == .@"struct" and @hasDecl(T, "_protoz_json_fields")) {
-        return try decodeMessageDepth(T, arena, p, opts, depth);
+        return try decodeMessageDepth(T, arena, p, opts, depth, known_types);
     } else if (comptime @typeInfo(T) == .@"enum") {
         return try decodeEnum(T, arena, p, opts);
     } else {
