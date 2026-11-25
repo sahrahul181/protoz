@@ -912,3 +912,408 @@ test "codegen + plugin: preserve_unknown_fields is strictly opt-in" {
     const resp = try plugin.processRequest(arena, req.written());
     try std.testing.expect(std.mem.indexOf(u8, resp, "wire.UnknownFields") == null or std.mem.indexOf(u8, resp, "proxy/ping.pb.zig") != null);
 }
+
+// ---------------------------------------------------------------------------
+// Phase 4: Zero-Allocation Well-Known Type Helper Tests
+// ---------------------------------------------------------------------------
+
+test "wkt: Timestamp RFC 3339 parse/format, leap years, offsets, and epoch math" {
+    const Ts = struct { seconds: i64 = 0, nanos: i32 = 0 };
+    const Dur = struct { seconds: i64 = 0, nanos: i32 = 0 };
+
+    var buf: [32]u8 = undefined;
+
+    // Boundary min & max dates
+    const min_ts = try wire.wkt.parseTimestamp(Ts, "0001-01-01T00:00:00Z");
+    try std.testing.expectEqual(wire.wkt.min_timestamp_seconds, min_ts.seconds);
+    try std.testing.expectEqualStrings("0001-01-01T00:00:00Z", try wire.wkt.formatTimestampBuf(min_ts, &buf));
+
+    const max_ts = try wire.wkt.parseTimestamp(Ts, "9999-12-31T23:59:59.999999999Z");
+    try std.testing.expectEqual(wire.wkt.max_timestamp_seconds, max_ts.seconds);
+    try std.testing.expectEqualStrings("9999-12-31T23:59:59.999999999Z", try wire.wkt.formatTimestampBuf(max_ts, &buf));
+
+    // Canonical 3 / 6 / 9 fractional digit precision + timezone offset normalization (+05:30 IST)
+    const ist = try wire.wkt.parseTimestamp(Ts, "2026-11-25T20:11:00.5+05:30");
+    try std.testing.expectEqualStrings("2026-11-25T14:41:00.500Z", try wire.wkt.formatTimestampBuf(ist, &buf));
+
+    const micros = try wire.wkt.parseTimestamp(Ts, "2024-02-29t12:00:00.000123z"); // leap day
+    try std.testing.expectEqualStrings("2024-02-29T12:00:00.000123Z", try wire.wkt.formatTimestampBuf(micros, &buf));
+
+    // Reject non-leap day & offset pushing past min bound
+    try std.testing.expectError(error.InvalidFormat, wire.wkt.parseTimestamp(Ts, "2023-02-29T00:00:00Z"));
+    try std.testing.expectError(error.OutOfRange, wire.wkt.parseTimestamp(Ts, "0001-01-01T00:00:00+01:00"));
+
+    // Negative epoch nanoseconds preserve non-negative nanos (-0.25s => seconds=-1, nanos=750_000_000)
+    const pre_epoch = try wire.wkt.timestampFromUnixNanos(Ts, -250_000_000);
+    try std.testing.expectEqual(@as(i64, -1), pre_epoch.seconds);
+    try std.testing.expectEqual(@as(i32, 750_000_000), pre_epoch.nanos);
+    try std.testing.expectEqual(@as(i128, -250_000_000), try wire.wkt.timestampToUnixNanos(pre_epoch));
+
+    // Timestamp + Duration arithmetic
+    const shifted = try wire.wkt.timestampAddDuration(pre_epoch, Dur{ .seconds = 0, .nanos = 250_000_000 });
+    try std.testing.expectEqual(@as(i64, 0), shifted.seconds);
+    try std.testing.expectEqual(@as(i32, 0), shifted.nanos);
+    const delta = try wire.wkt.timestampDiff(Dur, shifted, pre_epoch);
+    try std.testing.expectEqual(@as(i64, 0), delta.seconds);
+    try std.testing.expectEqual(@as(i32, 250_000_000), delta.nanos);
+}
+
+test "wkt: Duration ProtoJSON parse/format, sign rules, and arithmetic" {
+    const Dur = struct { seconds: i64 = 0, nanos: i32 = 0 };
+    var buf: [32]u8 = undefined;
+
+    // Negative sub-second duration formats as `-0.500s`, never `0.-500s`
+    const neg_half = try wire.wkt.parseDuration(Dur, "-0.5s");
+    try std.testing.expectEqual(@as(i64, 0), neg_half.seconds);
+    try std.testing.expectEqual(@as(i32, -500_000_000), neg_half.nanos);
+    try std.testing.expectEqualStrings("-0.500s", try wire.wkt.formatDurationBuf(neg_half, &buf));
+
+    const zero = try wire.wkt.parseDuration(Dur, "-0s");
+    try std.testing.expectEqualStrings("0s", try wire.wkt.formatDurationBuf(zero, &buf));
+
+    const max_dur = try wire.wkt.parseDuration(Dur, "-315576000000.999999999s");
+    try std.testing.expectEqualStrings("-315576000000.999999999s", try wire.wkt.formatDurationBuf(max_dur, &buf));
+
+    // Reject sign mismatch and out-of-range
+    try std.testing.expectError(error.SignMismatch, wire.wkt.validateDuration(Dur{ .seconds = 1, .nanos = -1 }));
+    try std.testing.expectError(error.OutOfRange, wire.wkt.parseDuration(Dur, "315576000001s"));
+    try std.testing.expectError(error.InvalidFormat, wire.wkt.parseDuration(Dur, "1.s"));
+    try std.testing.expectError(error.InvalidFormat, wire.wkt.parseDuration(Dur, ".5s"));
+
+    // Arithmetic across zero boundary
+    const sum = try wire.wkt.durationAdd(Dur{ .seconds = 1, .nanos = 0 }, neg_half);
+    try std.testing.expectEqual(@as(i64, 0), sum.seconds);
+    try std.testing.expectEqual(@as(i32, 500_000_000), sum.nanos);
+}
+
+test "wkt: Any zero-allocation packSlice, is, unpack, and custom prefixes" {
+    const Any = struct { type_url: []const u8 = "", value: []const u8 = "" };
+
+    const event = pb.SmallEvent{
+        .id = 777,
+        .timestamp_ns = 123456,
+        .status = 201,
+        .source = "gateway",
+    };
+
+    var val_buf: [128]u8 = undefined;
+    const packed_any = try wire.wkt.packAnySlice(Any, event, &val_buf);
+
+    try std.testing.expectEqualStrings("type.googleapis.com/" ++ pb.SmallEvent.proto_full_name, packed_any.type_url);
+    try std.testing.expect(wire.wkt.anyIs(packed_any, pb.SmallEvent));
+    try std.testing.expect(!wire.wkt.anyIs(packed_any, pb.UserProfile));
+
+    const unpacked = try wire.wkt.unpackAny(packed_any, pb.SmallEvent);
+    try std.testing.expectEqual(@as(u64, 777), unpacked.id);
+    try std.testing.expectEqualStrings("gateway", unpacked.source);
+
+    try std.testing.expectError(error.TypeUrlMismatch, wire.wkt.unpackAny(packed_any, pb.UserProfile));
+
+    // Custom domain prefix still matches `anyIs` by trailing full name
+    const custom_any = try wire.wkt.packAnyWithPrefixSlice(Any, "types.acme.dev", event, &val_buf);
+    try std.testing.expectEqualStrings("types.acme.dev/" ++ pb.SmallEvent.proto_full_name, custom_any.type_url);
+    try std.testing.expect(wire.wkt.anyIs(custom_any, pb.SmallEvent));
+
+    // Allocator-backed pack frees cleanly
+    const owned_any = try wire.wkt.packAnyAlloc(Any, std.testing.allocator, event);
+    defer std.testing.allocator.free(owned_any.value);
+    const decoded_owned = try wire.wkt.unpackAny(owned_any, pb.SmallEvent);
+    try std.testing.expectEqual(@as(u32, 201), decoded_owned.status);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: Zero-Allocation ProtoJSON Tests
+// ---------------------------------------------------------------------------
+
+test "json: flat message encodes and decodes with strictly zero heap allocations" {
+    const orig = pb.SmallEvent{
+        .id = 1_048_576,
+        .timestamp_ns = 1_764_075_000_123_456_789,
+        .status = 200,
+        .source = "edge-gw-01",
+    };
+
+    var json_buf: [256]u8 = undefined;
+    const json_text = try orig.encodeJsonSlice(&json_buf, .{});
+    try std.testing.expectEqualStrings(
+        "{\"id\":\"1048576\",\"timestampNs\":\"1764075000123456789\",\"status\":200,\"source\":\"edge-gw-01\"}",
+        json_text,
+    );
+
+    // Passing `failing_allocator` proves unescaped flat messages perform 0 allocations
+    const decoded = try pb.SmallEvent.decodeJson(std.testing.failing_allocator, json_text, .{});
+    try std.testing.expectEqual(orig.id, decoded.id);
+    try std.testing.expectEqual(orig.timestamp_ns, decoded.timestamp_ns);
+    try std.testing.expectEqual(orig.status, decoded.status);
+    try std.testing.expectEqualStrings(orig.source, decoded.source);
+
+    // Also accepts original snake_case field names and numeric 64-bit ints
+    const snake = "{\"id\":42,\"timestamp_ns\":-99,\"status\":\"404\",\"source\":\"gw\"}";
+    const d2 = try pb.SmallEvent.decodeJson(std.testing.failing_allocator, snake, .{});
+    try std.testing.expectEqual(@as(u64, 42), d2.id);
+    try std.testing.expectEqual(@as(i64, -99), d2.timestamp_ns);
+    try std.testing.expectEqual(@as(u32, 404), d2.status);
+}
+
+test "json: zero-alloc wire-to-JSON transcoding and full UserProfile round-trip" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const mgr = pb.UserProfile{ .id = 1, .name = "lead\ncto", .role = .ROLE_ADMIN };
+    const orig = pb.UserProfile{
+        .id = 9_876_543_210,
+        .name = "alice \"dev\" 🚀",
+        .role = .ROLE_MEMBER,
+        .scores = .{ .slice = &.{ 10, 20, 30 } },
+        .tags = .{ .slice = &.{ "zig", "protoz" } },
+        .quotas = .{ .slice = &.{
+            .{ .key = "cpu", .value = 16 },
+            .{ .key = "ram", .value = 64 },
+        } },
+        .address = .{ .city = "Gurugram", .zip = 122001 },
+        .verified = true,
+        .contact = .{ .email = "alice@acme.dev" },
+        .manager = .{ .ptr = &mgr },
+    };
+
+    // Transcode wire bytes -> zero-alloc view -> JSON without cloning
+    var wire_buf: [512]u8 = undefined;
+    const wire_bytes = try orig.encodeSlice(&wire_buf);
+    const wire_view = try pb.UserProfile.decode(wire_bytes);
+
+    var json_buf: [1024]u8 = undefined;
+    const json_text = try wire_view.encodeJsonSlice(&json_buf, .{});
+
+    try std.testing.expect(std.mem.indexOf(u8, json_text, "\"role\":\"ROLE_MEMBER\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json_text, "\"email\":\"alice@acme.dev\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json_text, "\"scores\":[10,20,30]") != null);
+
+    // Round-trip back from JSON
+    const decoded = try pb.UserProfile.decodeJson(arena, json_text, .{});
+    try std.testing.expectEqual(orig.id, decoded.id);
+    try std.testing.expectEqualStrings("alice \"dev\" 🚀", decoded.name);
+    try std.testing.expectEqual(pb.Role.ROLE_MEMBER, decoded.role);
+    try std.testing.expectEqualSlices(u32, &.{ 10, 20, 30 }, decoded.scores.slice);
+    try std.testing.expectEqual(@as(?i32, 64), try decoded.quotas.get("ram"));
+    try std.testing.expectEqualStrings("Gurugram", decoded.address.?.city);
+    try std.testing.expectEqualStrings("alice@acme.dev", decoded.contact.?.email);
+    const d_mgr = try decoded.manager.?.decode();
+    try std.testing.expectEqualStrings("lead\ncto", d_mgr.name);
+
+    // Reject duplicate oneof variants, and honor ignore_unknown_fields + surrogate pairs
+    try std.testing.expectError(
+        error.DuplicateOneofField,
+        pb.UserProfile.decodeJson(arena, "{\"email\":\"a@b\",\"phone\":\"123\"}", .{}),
+    );
+    const escaped_with_unknown = "{\"name\":\"hi \\uD83D\\uDE80\",\"unknownObj\":{\"a\":[1,true,null]}}";
+    try std.testing.expectError(error.UnknownField, pb.UserProfile.decodeJson(arena, escaped_with_unknown, .{}));
+    const ok = try pb.UserProfile.decodeJson(arena, escaped_with_unknown, .{ .ignore_unknown_fields = true });
+    try std.testing.expectEqualStrings("hi 🚀", ok.name);
+}
+
+test "json: WKT Timestamp, Duration, BytesValue, and special floats" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const MockTs = struct {
+        pub const proto_full_name: []const u8 = "google.protobuf.Timestamp";
+        pub const _protoz_json_fields: []const wire.json.JsonFieldMeta = &.{};
+        seconds: i64 = 0,
+        nanos: i32 = 0,
+    };
+    const MockDur = struct {
+        pub const proto_full_name: []const u8 = "google.protobuf.Duration";
+        pub const _protoz_json_fields: []const wire.json.JsonFieldMeta = &.{};
+        seconds: i64 = 0,
+        nanos: i32 = 0,
+    };
+    const MockBytes = struct {
+        pub const proto_full_name: []const u8 = "google.protobuf.BytesValue";
+        pub const _protoz_json_fields: []const wire.json.JsonFieldMeta = &.{};
+        value: []const u8 = "",
+    };
+
+    var buf: [128]u8 = undefined;
+
+    const ts = try wire.json.decodeMessage(MockTs, std.testing.failing_allocator, "\"2026-11-25T14:41:00.500Z\"", .{});
+    try std.testing.expectEqualStrings("\"2026-11-25T14:41:00.500Z\"", try wire.json.encodeMessageSlice(ts, &buf, .{}));
+
+    const dur = try wire.json.decodeMessage(MockDur, std.testing.failing_allocator, "\"-0.5s\"", .{});
+    try std.testing.expectEqualStrings("\"-0.500s\"", try wire.json.encodeMessageSlice(dur, &buf, .{}));
+
+    // Standard & URL-safe unpadded Base64 decode
+    const bv = try wire.json.decodeMessage(MockBytes, arena, "\"aGVsbG8\"", .{});
+    try std.testing.expectEqualStrings("hello", bv.value);
+    try std.testing.expectEqualStrings("\"aGVsbG8=\"", try wire.json.encodeMessageSlice(bv, &buf, .{}));
+
+    // Special float values (NaN / Infinity / -Infinity)
+    const pt = pb.TelemetryBatch.Point{ .ts = 1, .value = std.math.inf(f64), .label = "inf" };
+    const pt_json = try pt.encodeJsonSlice(&buf, .{});
+    try std.testing.expect(std.mem.indexOf(u8, pt_json, "\"value\":\"Infinity\"") != null);
+    const pt_dec = try pb.TelemetryBatch.Point.decodeJson(std.testing.failing_allocator, pt_json, .{});
+    try std.testing.expectEqual(std.math.inf(f64), pt_dec.value);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: gRPC Framing & Service Descriptor Codegen Tests
+// ---------------------------------------------------------------------------
+
+test "rpc: gRPC 5-byte framing round-trip, partial reads, compression flag, and FrameTooLarge" {
+    const e1 = pb.SmallEvent{ .id = 10, .status = 200, .source = "rpc-1" };
+    const e2 = pb.SmallEvent{ .id = 20, .status = 201, .source = "rpc-2" };
+
+    var stream_buf: [256]u8 = undefined;
+    var sw = wire.SliceWriter.init(&stream_buf);
+
+    var f1_buf: [64]u8 = undefined;
+    const f1 = try wire.rpc.encodeGrpcSlice(e1, &f1_buf);
+    try std.testing.expectEqual(wire.rpc.encodedGrpcSize(e1), f1.len);
+    try std.testing.expectEqual(@as(u8, 0), f1[0]);
+    try sw.writeAll(f1);
+    try wire.rpc.encodeGrpc(e2, &sw);
+
+    const stream = sw.written();
+
+    // Every prefix shorter than frame 1 returns null (awaiting more HTTP/2 DATA bytes)
+    for (0..f1.len) |partial_len| {
+        try std.testing.expectEqual(
+            @as(?wire.rpc.GrpcFrame(pb.SmallEvent), null),
+            try wire.rpc.tryDecodeGrpc(pb.SmallEvent, stream[0..partial_len], 1024),
+        );
+    }
+
+    // Oversized frame rejected immediately from the 5-byte header
+    try std.testing.expectError(
+        error.FrameTooLarge,
+        wire.rpc.tryDecodeGrpc(pb.SmallEvent, stream, 4),
+    );
+
+    // Invalid compression flag (neither 0 nor 1) & compressed frame handling
+    const bad_flag = [_]u8{ 2, 0, 0, 0, 0 };
+    try std.testing.expectError(
+        error.InvalidCompressionFlag,
+        wire.rpc.tryDecodeGrpcRaw(&bad_flag, 1024),
+    );
+    const compressed_empty = [_]u8{ 1, 0, 0, 0, 0 };
+    try std.testing.expectError(
+        error.CompressedFrameUnsupported,
+        wire.rpc.tryDecodeGrpc(pb.SmallEvent, &compressed_empty, 1024),
+    );
+
+    // Iterate both frames with zero allocations
+    var it = wire.rpc.GrpcFrameIterator(pb.SmallEvent).init(stream, 1024);
+    const d1 = (try it.next()).?;
+    const d2 = (try it.next()).?;
+    try std.testing.expectEqual(@as(?pb.SmallEvent, null), try it.next());
+    try std.testing.expectEqual(@as(u64, 10), d1.id);
+    try std.testing.expectEqualStrings("rpc-1", d1.source);
+    try std.testing.expectEqual(@as(u64, 20), d2.id);
+    try std.testing.expectEqualStrings("rpc-2", d2.source);
+}
+
+test "rpc: zero-allocation comptime dispatchUnary and dispatchUnaryGrpc" {
+    const MockService = struct {
+        pub const proto_full_name: []const u8 = "bench.EventService";
+        pub const MethodId = enum { Echo, StreamEvents };
+
+        pub const Echo = struct {
+            pub const name: []const u8 = "Echo";
+            pub const zig_name: []const u8 = "echo";
+            pub const path: []const u8 = "/bench.EventService/Echo";
+            pub const Request = pb.SmallEvent;
+            pub const Response = pb.SmallEvent;
+            pub const client_streaming: bool = false;
+            pub const server_streaming: bool = false;
+            pub const stream_kind: wire.rpc.StreamKind = .unary;
+        };
+
+        pub const StreamEvents = struct {
+            pub const name: []const u8 = "StreamEvents";
+            pub const zig_name: []const u8 = "streamEvents";
+            pub const path: []const u8 = "/bench.EventService/StreamEvents";
+            pub const Request = pb.SmallEvent;
+            pub const Response = pb.SmallEvent;
+            pub const client_streaming: bool = false;
+            pub const server_streaming: bool = true;
+            pub const stream_kind: wire.rpc.StreamKind = .server_streaming;
+        };
+
+        pub const methods = .{ Echo, StreamEvents };
+    };
+
+    const Handler = struct {
+        calls: u32 = 0,
+
+        pub fn echo(self: *@This(), req: pb.SmallEvent) !pb.SmallEvent {
+            self.calls += 1;
+            return .{
+                .id = req.id + 1,
+                .status = 200,
+                .source = req.source,
+            };
+        }
+    };
+
+    var handler: Handler = .{};
+    const req = pb.SmallEvent{ .id = 41, .source = "client" };
+
+    var req_buf: [64]u8 = undefined;
+    var resp_buf: [64]u8 = undefined;
+    const req_grpc = try wire.rpc.encodeGrpcSlice(req, &req_buf);
+
+    const resp_grpc = try wire.rpc.dispatchUnaryGrpc(
+        MockService,
+        &handler,
+        "/bench.EventService/Echo",
+        req_grpc,
+        1024,
+        &resp_buf,
+    );
+    const decoded_frame = (try wire.rpc.tryDecodeGrpc(pb.SmallEvent, resp_grpc, 1024)).?;
+    try std.testing.expectEqual(@as(u32, 1), handler.calls);
+    try std.testing.expectEqual(@as(u64, 42), decoded_frame.msg.id);
+    try std.testing.expectEqualStrings("client", decoded_frame.msg.source);
+
+    // Unknown or non-unary path returns error.Unimplemented
+    try std.testing.expectError(
+        error.Unimplemented,
+        wire.rpc.dispatchUnaryGrpc(MockService, &handler, "/bench.EventService/Unknown", req_grpc, 1024, &resp_buf),
+    );
+    try std.testing.expectError(
+        error.Unimplemented,
+        wire.rpc.dispatchUnaryGrpc(MockService, &handler, "/bench.EventService/StreamEvents", req_grpc, 1024, &resp_buf),
+    );
+}
+
+test "codegen: emits typed gRPC service descriptors, paths, and streaming kinds" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const src =
+        \\syntax = "proto3";
+        \\package acme.v1;
+        \\message Ping { uint64 id = 1; }
+        \\message Pong { uint64 id = 1; }
+        \\service Health {
+        \\  rpc Check (Ping) returns (Pong);
+        \\  rpc Watch (Ping) returns (stream Pong);
+        \\  rpc Chat (stream Ping) returns (stream Pong);
+        \\}
+    ;
+    const file = try parser.Parser.parse(arena, src);
+    const res = try resolver.Resolver.build(arena, &file);
+
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try codegen.generateFile(arena, 0, &res, &out.writer);
+    const gen = out.written();
+
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub const Health = struct {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub const path: []const u8 = \"/acme.v1.Health/Check\";") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub const zig_name: []const u8 = \"check\";") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub const stream_kind: wire.rpc.StreamKind = .server_streaming;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub const stream_kind: wire.rpc.StreamKind = .bidi_streaming;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub fn matchPath(path: []const u8) ?MethodId {") != null);
+}

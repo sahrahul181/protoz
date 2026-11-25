@@ -721,6 +721,38 @@ test "fuzz: std.testing.fuzz wire corpus and coverage hook" {
 // Works natively on Windows, macOS, and Linux.
 // ---------------------------------------------------------------------------
 
+test "wkt: generated Timestamp, Duration, and Any delegate methods" {
+    const Ts = wkt.google_protobuf_timestamp.Timestamp;
+    const Dur = wkt.google_protobuf_duration.Duration;
+    const Any = wkt.google_protobuf_any.Any;
+
+    try std.testing.expectEqualStrings("google.protobuf.Timestamp", Ts.proto_full_name);
+    try std.testing.expectEqualStrings("google.protobuf.Duration", Dur.proto_full_name);
+    try std.testing.expectEqualStrings("google.protobuf.Any", Any.proto_full_name);
+
+    var buf: [32]u8 = undefined;
+    const ts = try Ts.parseRfc3339("2026-11-25T14:41:00.5Z");
+    try ts.validate();
+    try std.testing.expectEqualStrings("2026-11-25T14:41:00.500Z", try ts.formatRfc3339Buf(&buf));
+
+    const dur = try Dur.parseProtoJson("1.5s");
+    try dur.validate();
+    try std.testing.expectEqualStrings("1.500s", try dur.formatProtoJsonBuf(&buf));
+    const ts2 = try ts.addDuration(dur);
+    const diff = try ts2.diff(Dur, ts);
+    try std.testing.expectEqual(@as(i64, 1), diff.seconds);
+    try std.testing.expectEqual(@as(i32, 500_000_000), diff.nanos);
+
+    const ev = pb.SmallEvent{ .id = 99, .source = "wkt-delegate" };
+    var val_buf: [128]u8 = undefined;
+    const packed_any = try Any.packSlice(ev, &val_buf);
+    try std.testing.expect(packed_any.is(pb.SmallEvent));
+    try std.testing.expectEqualStrings(pb.SmallEvent.proto_full_name, packed_any.typeName().?);
+    const unpacked = try packed_any.unpack(pb.SmallEvent);
+    try std.testing.expectEqual(@as(u64, 99), unpacked.id);
+    try std.testing.expectEqualStrings("wkt-delegate", unpacked.source);
+}
+
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     var iters: usize = 100_000;

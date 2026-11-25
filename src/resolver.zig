@@ -163,6 +163,29 @@ pub const Resolver = struct {
                     try std.fmt.allocPrint(self.arena, "{s}.{s}", .{ pkg_prefix, m.name });
                 try self.validateMessage(file.name, file.syntax, m, fqn);
             }
+            for (file.services) |svc| {
+                for (svc.rpcs) |rpc| {
+                    try self.validateRpcEndpointType(file.name, pkg_prefix, svc.name, rpc.name, "request", rpc.req_type);
+                    try self.validateRpcEndpointType(file.name, pkg_prefix, svc.name, rpc.name, "response", rpc.res_type);
+                }
+            }
+        }
+    }
+
+    fn validateRpcEndpointType(
+        self: *const Resolver,
+        file_name: []const u8,
+        pkg_prefix: []const u8,
+        svc_name: []const u8,
+        rpc_name: []const u8,
+        role: []const u8,
+        type_name: []const u8,
+    ) !void {
+        const rt = self.resolveType(pkg_prefix, type_name) catch |err| {
+            return self.fail(file_name, "unknown {s} type '{s}' in rpc '{s}.{s}'", .{ role, type_name, svc_name, rpc_name }, err);
+        };
+        if (rt != .message) {
+            return self.fail(file_name, "rpc '{s}.{s}' {s} type '{s}' must be a message", .{ svc_name, rpc_name, role, type_name }, error.RpcTypeMustBeMessage);
         }
     }
 

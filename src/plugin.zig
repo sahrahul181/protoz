@@ -168,6 +168,7 @@ fn decodeFileDescriptorProto(arena: std.mem.Allocator, bytes: []const u8) !ast.F
     var public_imports: std.ArrayList(usize) = .empty;
     var enums: std.ArrayList(ast.Enum) = .empty;
     var raw_msgs: std.ArrayList([]const u8) = .empty;
+    var services: std.ArrayList(ast.Service) = .empty;
 
     var r = wire.Reader.init(bytes);
     while (try r.readTag()) |tag| {
@@ -177,6 +178,7 @@ fn decodeFileDescriptorProto(arena: std.mem.Allocator, bytes: []const u8) !ast.F
             3 => try imports.append(arena, try r.readBytes()),
             4 => try raw_msgs.append(arena, try r.readBytes()),
             5 => try enums.append(arena, try decodeEnumDescriptor(arena, try r.readBytes())),
+            6 => try services.append(arena, try decodeServiceDescriptorProto(arena, try r.readBytes())),
             10 => { // public_dependency (repeated int32, packed or unpacked)
                 if (tag.wire_type == .len) {
                     var pr = wire.Reader.init(try r.readBytes());
@@ -219,7 +221,52 @@ fn decodeFileDescriptorProto(arena: std.mem.Allocator, bytes: []const u8) !ast.F
         .options = &.{},
         .messages = try messages.toOwnedSlice(arena),
         .enums = try enums.toOwnedSlice(arena),
-        .services = &.{},
+        .services = try services.toOwnedSlice(arena),
+    };
+}
+
+fn decodeServiceDescriptorProto(arena: std.mem.Allocator, bytes: []const u8) !ast.Service {
+    var name: []const u8 = "";
+    var rpcs: std.ArrayList(ast.Rpc) = .empty;
+
+    var r = wire.Reader.init(bytes);
+    while (try r.readTag()) |tag| {
+        switch (tag.field_number) {
+            1 => name = try r.readBytes(),
+            2 => try rpcs.append(arena, try decodeMethodDescriptorProto(try r.readBytes())),
+            else => try r.skipField(tag, wire.max_recursion_depth),
+        }
+    }
+    return .{
+        .name = name,
+        .rpcs = try rpcs.toOwnedSlice(arena),
+    };
+}
+
+fn decodeMethodDescriptorProto(bytes: []const u8) !ast.Rpc {
+    var name: []const u8 = "";
+    var req_type: []const u8 = "";
+    var res_type: []const u8 = "";
+    var req_stream = false;
+    var res_stream = false;
+
+    var r = wire.Reader.init(bytes);
+    while (try r.readTag()) |tag| {
+        switch (tag.field_number) {
+            1 => name = try r.readBytes(),
+            2 => req_type = try r.readBytes(),
+            3 => res_type = try r.readBytes(),
+            5 => req_stream = (try r.readVarint()) != 0,
+            6 => res_stream = (try r.readVarint()) != 0,
+            else => try r.skipField(tag, wire.max_recursion_depth),
+        }
+    }
+    return .{
+        .name = name,
+        .req_type = req_type,
+        .req_stream = req_stream,
+        .res_type = res_type,
+        .res_stream = res_stream,
     };
 }
 

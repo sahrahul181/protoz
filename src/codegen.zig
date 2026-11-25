@@ -162,6 +162,21 @@ const ImportTable = struct {
         }
     }
 
+    fn collectService(
+        self: *ImportTable,
+        arena: std.mem.Allocator,
+        svc: ast.Service,
+        pkg_scope: []const u8,
+        res: *const resolver.Resolver,
+    ) !void {
+        for (svc.rpcs) |rpc| {
+            const req_rt = try res.resolveType(pkg_scope, rpc.req_type);
+            if (req_rt == .message) try self.noteSymbol(arena, req_rt.message);
+            const res_rt = try res.resolveType(pkg_scope, rpc.res_type);
+            if (res_rt == .message) try self.noteSymbol(arena, res_rt.message);
+        }
+    }
+
     fn writeSymPath(self: *const ImportTable, w: *std.Io.Writer, sym: resolver.Symbol) !void {
         if (sym.file_index != self.file_idx) {
             const alias_id = self.alias_by_file.get(sym.file_index).?;
@@ -289,16 +304,26 @@ fn unknownFieldsMemberName(m: ast.Message) []const u8 {
     return "_unknown_fields";
 }
 
-fn writePascalCase(w: *std.Io.Writer, snake: []const u8) !void {
-    var cap = true;
+fn writeCamelCase(w: *std.Io.Writer, snake: []const u8, initial_cap: bool) !void {
+    var cap = initial_cap;
     for (snake) |ch| {
         if (ch == '_') {
             cap = true;
-        } else {
-            try w.writeByte(if (cap) std.ascii.toUpper(ch) else ch);
+        } else if (cap) {
+            try w.writeByte(std.ascii.toUpper(ch));
             cap = false;
+        } else {
+            try w.writeByte(ch);
         }
     }
+}
+
+fn writePascalCase(w: *std.Io.Writer, snake: []const u8) !void {
+    return writeCamelCase(w, snake, true);
+}
+
+fn writeLowerCamelCase(w: *std.Io.Writer, proto_name: []const u8) !void {
+    return writeCamelCase(w, proto_name, false);
 }
 
 /// Backward-compatible single-file generator.
@@ -366,6 +391,9 @@ pub fn generateFileWithOptions(
             try std.fmt.allocPrint(arena, "{s}.{s}", .{ pkg_scope, m.name });
         try imp_table.collectMessage(arena, m, fqn, res);
     }
+    for (file.services) |svc| {
+        try imp_table.collectService(arena, svc, pkg_scope, res);
+    }
 
     var pub_visited: std.AutoHashMapUnmanaged(usize, void) = .empty;
     try pub_visited.put(arena, file_idx, {});
@@ -401,30 +429,20 @@ pub fn generateFileWithOptions(
         var declared: std.StringHashMapUnmanaged(void) = .empty;
         for (file.enums) |e| try declared.put(arena, e.name, {});
         for (file.messages) |m| try declared.put(arena, m.name, {});
+        for (file.services) |svc| try declared.put(arena, svc.name, {});
 
         var emitted_any = false;
         for (pub_deps.items) |dep_idx| {
             const alias_id = imp_table.alias_by_file.get(dep_idx).?;
             const dep_file = &res.files[dep_idx];
             for (dep_file.enums) |e| {
-                if (declared.contains(e.name)) continue;
-                try declared.put(arena, e.name, {});
-                try w.writeAll("pub const ");
-                try writeIdent(w, e.name);
-                try w.print(" = _imp_{d}.", .{alias_id});
-                try writeIdent(w, e.name);
-                try w.writeAll(";\n");
-                emitted_any = true;
+                if (try emitReexport(w, arena, &declared, e.name, alias_id)) emitted_any = true;
             }
             for (dep_file.messages) |m| {
-                if (declared.contains(m.name)) continue;
-                try declared.put(arena, m.name, {});
-                try w.writeAll("pub const ");
-                try writeIdent(w, m.name);
-                try w.print(" = _imp_{d}.", .{alias_id});
-                try writeIdent(w, m.name);
-                try w.writeAll(";\n");
-                emitted_any = true;
+                if (try emitReexport(w, arena, &declared, m.name, alias_id)) emitted_any = true;
+            }
+            for (dep_file.services) |svc| {
+                if (try emitReexport(w, arena, &declared, svc.name, alias_id)) emitted_any = true;
             }
         }
         if (emitted_any) try w.writeAll("\n");
@@ -443,6 +461,28 @@ pub fn generateFileWithOptions(
         try emitMessage(ctx, m, fqn, 0, w);
         try w.writeAll("\n");
     }
+
+    for (file.services) |svc| {
+        try emitService(ctx, svc, pkg_scope, w);
+        try w.writeAll("\n");
+    }
+}
+
+fn emitReexport(
+    w: *std.Io.Writer,
+    arena: std.mem.Allocator,
+    declared: *std.StringHashMapUnmanaged(void),
+    name: []const u8,
+    alias_id: usize,
+) !bool {
+    if (declared.contains(name)) return false;
+    try declared.put(arena, name, {});
+    try w.writeAll("pub const ");
+    try writeIdent(w, name);
+    try w.print(" = _imp_{d}.", .{alias_id});
+    try writeIdent(w, name);
+    try w.writeAll(";\n");
+    return true;
 }
 
 fn emitEnum(e: ast.Enum, indent: usize, w: *std.Io.Writer) !void {
@@ -497,6 +537,21 @@ fn emitMessage(ctx: GenCtx, m: ast.Message, scope_fqn: []const u8, indent: usize
     try w.writeAll("pub const ");
     try writeIdent(w, m.name);
     try w.writeAll(" = struct {\n");
+
+    var has_full_name_collision = false;
+    for (m.fields) |f| if (std.mem.eql(u8, f.name, "proto_full_name")) {
+        has_full_name_collision = true;
+    };
+    for (m.maps) |mp| if (std.mem.eql(u8, mp.name, "proto_full_name")) {
+        has_full_name_collision = true;
+    };
+    for (m.oneofs) |o| if (std.mem.eql(u8, o.name, "proto_full_name")) {
+        has_full_name_collision = true;
+    };
+    if (!has_full_name_collision) {
+        try writeIndent(w, indent + 1);
+        try w.print("pub const proto_full_name: []const u8 = \"{s}\";\n\n", .{scope_fqn});
+    }
 
     for (m.nested_enums) |ne| {
         try emitEnum(ne, indent + 1, w);
@@ -1006,11 +1061,135 @@ fn emitMessage(ctx: GenCtx, m: ast.Message, scope_fqn: []const u8, indent: usize
     try writeIndent(w, indent + 1);
     try w.writeAll("}\n");
 
+    try emitJsonMeta(ctx, m, scope_fqn, indent, w);
+
     // Zero-allocation streaming FieldIterator
     try emitFieldIterator(ctx, m, scope_fqn, has_members, indent, w);
+    try emitWktMethods(scope_fqn, indent, w);
 
     try writeIndent(w, indent);
     try w.writeAll("};\n");
+}
+
+fn emitJsonMeta(ctx: GenCtx, m: ast.Message, scope_fqn: []const u8, indent: usize, w: *std.Io.Writer) !void {
+    try w.writeAll("\n");
+    try writeIndent(w, indent + 1);
+    try w.writeAll("pub const _protoz_json_fields: []const wire.json.JsonFieldMeta = &.{\n");
+
+    for (m.fields) |f| {
+        const rt = try ctx.res.resolveType(scope_fqn, f.type_name);
+        const is_bytes = (rt == .scalar and std.mem.eql(u8, rt.scalar.wire_kind, ".bytes"));
+        const kind_name: []const u8 = if (f.label == .repeated)
+            ".repeated"
+        else switch (rt) {
+            .scalar => ".scalar",
+            .@"enum" => ".@\"enum\"",
+            .message => |sym| if (try ctx.res.createsCycle(scope_fqn, sym.proto_fqn)) ".lazy_message" else ".message",
+        };
+        const explicit = f.label != .repeated and rt != .message and ctx.res.hasExplicitPresence(ctx.file_idx, f, rt);
+
+        try writeIndent(w, indent + 2);
+        try w.print(".{{ .zig_name = \"{s}\", .proto_name = \"{s}\", .json_name = \"", .{ f.name, f.name });
+        try writeLowerCamelCase(w, f.name);
+        try w.print("\", .kind = {s}, .is_bytes = {}, .explicit_presence = {}, .elem_is_bytes = {} }},\n", .{
+            kind_name,
+            is_bytes and f.label != .repeated,
+            explicit,
+            is_bytes and f.label == .repeated,
+        });
+    }
+
+    for (m.maps) |mp| {
+        const vt = try ctx.res.resolveType(scope_fqn, mp.value_type);
+        const val_is_bytes = (vt == .scalar and std.mem.eql(u8, vt.scalar.wire_kind, ".bytes"));
+        try writeIndent(w, indent + 2);
+        try w.print(".{{ .zig_name = \"{s}\", .proto_name = \"{s}\", .json_name = \"", .{ mp.name, mp.name });
+        try writeLowerCamelCase(w, mp.name);
+        try w.print("\", .kind = .map, .elem_is_bytes = {} }},\n", .{val_is_bytes});
+    }
+
+    for (m.oneofs) |o| {
+        for (o.fields) |f| {
+            const rt = try ctx.res.resolveType(scope_fqn, f.type_name);
+            const is_bytes = (rt == .scalar and std.mem.eql(u8, rt.scalar.wire_kind, ".bytes"));
+            const is_lazy = (rt == .message and try ctx.res.createsCycle(scope_fqn, rt.message.proto_fqn));
+            try writeIndent(w, indent + 2);
+            try w.print(".{{ .zig_name = \"{s}\", .proto_name = \"{s}\", .json_name = \"", .{ f.name, f.name });
+            try writeLowerCamelCase(w, f.name);
+            try w.print("\", .kind = .oneof, .is_bytes = {}, .oneof_field = \"{s}\", .is_lazy = {} }},\n", .{
+                is_bytes,
+                o.name,
+                is_lazy,
+            });
+        }
+    }
+
+    try writeIndent(w, indent + 1);
+    try w.writeAll("};\n\n");
+
+    try writeIndent(w, indent + 1);
+    try w.writeAll("pub fn encodeJson(self: @This(), w: anytype, opts: wire.json.EncodeOptions) wire.json.EncodeError(@TypeOf(w))!void {\n");
+    try writeIndent(w, indent + 2);
+    try w.writeAll("return wire.json.encodeMessage(self, w, opts);\n");
+    try writeIndent(w, indent + 1);
+    try w.writeAll("}\n\n");
+
+    try writeIndent(w, indent + 1);
+    try w.writeAll("pub fn encodeJsonSlice(self: @This(), buf: []u8, opts: wire.json.EncodeOptions) wire.json.SliceEncodeError![]const u8 {\n");
+    try writeIndent(w, indent + 2);
+    try w.writeAll("return wire.json.encodeMessageSlice(self, buf, opts);\n");
+    try writeIndent(w, indent + 1);
+    try w.writeAll("}\n\n");
+
+    try writeIndent(w, indent + 1);
+    try w.writeAll("pub fn decodeJson(arena: wire.Allocator, input: []const u8, opts: wire.json.DecodeOptions) wire.json.DecodeError!@This() {\n");
+    try writeIndent(w, indent + 2);
+    try w.writeAll("return wire.json.decodeMessage(@This(), arena, input, opts);\n");
+    try writeIndent(w, indent + 1);
+    try w.writeAll("}\n");
+}
+
+fn emitWktMethods(scope_fqn: []const u8, indent: usize, w: *std.Io.Writer) !void {
+    const lines: []const []const u8 = if (std.mem.eql(u8, scope_fqn, "google.protobuf.Timestamp")) &.{
+        "pub fn validate(self: @This()) wire.wkt.WktError!void { return wire.wkt.validateTimestamp(self); }",
+        "pub fn fromUnixSeconds(seconds: i64) wire.wkt.WktError!@This() { return wire.wkt.timestampFromUnixSeconds(@This(), seconds); }",
+        "pub fn fromUnixMillis(millis: i64) wire.wkt.WktError!@This() { return wire.wkt.timestampFromUnixMillis(@This(), millis); }",
+        "pub fn fromUnixNanos(total_ns: i128) wire.wkt.WktError!@This() { return wire.wkt.timestampFromUnixNanos(@This(), total_ns); }",
+        "pub fn toUnixNanos(self: @This()) wire.wkt.WktError!i128 { return wire.wkt.timestampToUnixNanos(self); }",
+        "pub fn toUnixMillis(self: @This()) wire.wkt.WktError!i64 { return wire.wkt.timestampToUnixMillis(self); }",
+        "pub fn addDuration(self: @This(), dur: anytype) wire.wkt.WktError!@This() { return wire.wkt.timestampAddDuration(self, dur); }",
+        "pub fn diff(self: @This(), comptime DurT: type, other: @This()) wire.wkt.WktError!DurT { return wire.wkt.timestampDiff(DurT, self, other); }",
+        "pub fn formatRfc3339Buf(self: @This(), buf: *[32]u8) wire.wkt.WktError![]const u8 { return wire.wkt.formatTimestampBuf(self, buf); }",
+        "pub fn formatRfc3339(self: @This(), w: *wire.Writer) (wire.wkt.WktError || wire.Writer.Error)!void { return wire.wkt.formatTimestamp(self, w); }",
+        "pub fn parseRfc3339(input: []const u8) wire.wkt.WktError!@This() { return wire.wkt.parseTimestamp(@This(), input); }",
+    } else if (std.mem.eql(u8, scope_fqn, "google.protobuf.Duration")) &.{
+        "pub fn validate(self: @This()) wire.wkt.WktError!void { return wire.wkt.validateDuration(self); }",
+        "pub fn fromSeconds(seconds: i64) wire.wkt.WktError!@This() { return wire.wkt.durationFromSeconds(@This(), seconds); }",
+        "pub fn fromMillis(millis: i64) wire.wkt.WktError!@This() { return wire.wkt.durationFromMillis(@This(), millis); }",
+        "pub fn fromNanos(total_ns: i128) wire.wkt.WktError!@This() { return wire.wkt.durationFromNanos(@This(), total_ns); }",
+        "pub fn toNanos(self: @This()) wire.wkt.WktError!i128 { return wire.wkt.durationToNanos(self); }",
+        "pub fn toMillis(self: @This()) wire.wkt.WktError!i64 { return wire.wkt.durationToMillis(self); }",
+        "pub fn add(self: @This(), other: @This()) wire.wkt.WktError!@This() { return wire.wkt.durationAdd(self, other); }",
+        "pub fn sub(self: @This(), other: @This()) wire.wkt.WktError!@This() { return wire.wkt.durationSub(self, other); }",
+        "pub fn negate(self: @This()) wire.wkt.WktError!@This() { return wire.wkt.durationNegate(self); }",
+        "pub fn formatProtoJsonBuf(self: @This(), buf: *[32]u8) wire.wkt.WktError![]const u8 { return wire.wkt.formatDurationBuf(self, buf); }",
+        "pub fn formatProtoJson(self: @This(), w: *wire.Writer) (wire.wkt.WktError || wire.Writer.Error)!void { return wire.wkt.formatDuration(self, w); }",
+        "pub fn parseProtoJson(input: []const u8) wire.wkt.WktError!@This() { return wire.wkt.parseDuration(@This(), input); }",
+    } else if (std.mem.eql(u8, scope_fqn, "google.protobuf.Any")) &.{
+        "pub fn typeName(self: @This()) ?[]const u8 { return wire.wkt.anyTypeName(self.type_url); }",
+        "pub inline fn is(self: @This(), comptime M: type) bool { return wire.wkt.anyIs(self, M); }",
+        "pub fn unpack(self: @This(), comptime M: type) wire.wkt.AnyError!M { return wire.wkt.unpackAny(self, M); }",
+        "pub fn packSlice(msg: anytype, value_buf: []u8) wire.EncodeError!@This() { return wire.wkt.packAnySlice(@This(), msg, value_buf); }",
+        "pub fn packWithPrefixSlice(comptime prefix: []const u8, msg: anytype, value_buf: []u8) wire.EncodeError!@This() { return wire.wkt.packAnyWithPrefixSlice(@This(), prefix, msg, value_buf); }",
+        "pub fn packAlloc(allocator: wire.Allocator, msg: anytype) wire.Allocator.Error!@This() { return wire.wkt.packAnyAlloc(@This(), allocator, msg); }",
+    } else return;
+
+    try w.writeAll("\n");
+    for (lines) |line| {
+        try writeIndent(w, indent + 1);
+        try w.writeAll(line);
+        try w.writeAll("\n");
+    }
 }
 
 fn emitSkipOrReject(m: ast.Message, has_members: bool, indent: usize, w: *std.Io.Writer) !void {
@@ -1833,4 +2012,104 @@ fn emitOneofDecode(ctx: GenCtx, o: ast.Oneof, scope_fqn: []const u8, indent: usi
             try w.writeAll("},\n");
         }
     }
+}
+
+fn writeRpcZigName(w: *std.Io.Writer, rpc_name: []const u8) !void {
+    if (rpc_name.len == 0) return;
+    try w.writeByte(std.ascii.toLower(rpc_name[0]));
+    try w.writeAll(rpc_name[1..]);
+}
+
+fn streamKindExpr(req_stream: bool, res_stream: bool) []const u8 {
+    if (req_stream and res_stream) return ".bidi_streaming";
+    if (req_stream) return ".client_streaming";
+    if (res_stream) return ".server_streaming";
+    return ".unary";
+}
+
+fn emitService(
+    ctx: GenCtx,
+    svc: ast.Service,
+    pkg_scope: []const u8,
+    w: *std.Io.Writer,
+) !void {
+    const svc_full_name = if (pkg_scope.len == 0)
+        svc.name
+    else
+        try std.fmt.allocPrint(ctx.arena, "{s}.{s}", .{ pkg_scope, svc.name });
+
+    try w.writeAll("pub const ");
+    try writeIdent(w, svc.name);
+    try w.writeAll(" = struct {\n");
+    try w.print("    pub const proto_full_name: []const u8 = \"{s}\";\n\n", .{svc_full_name});
+
+    for (svc.rpcs) |rpc| {
+        const req_rt = try ctx.res.resolveType(pkg_scope, rpc.req_type);
+        if (req_rt != .message) return error.RpcTypeMustBeMessage;
+        const res_rt = try ctx.res.resolveType(pkg_scope, rpc.res_type);
+        if (res_rt != .message) return error.RpcTypeMustBeMessage;
+
+        try w.writeAll("    pub const ");
+        try writeIdent(w, rpc.name);
+        try w.writeAll(" = struct {\n");
+        try w.print("        pub const name: []const u8 = \"{s}\";\n", .{rpc.name});
+        try w.writeAll("        pub const zig_name: []const u8 = \"");
+        try writeRpcZigName(w, rpc.name);
+        try w.writeAll("\";\n");
+        try w.print("        pub const path: []const u8 = \"/{s}/{s}\";\n", .{ svc_full_name, rpc.name });
+        try w.writeAll("        pub const Request = ");
+        try ctx.imports.writeSymPath(w, req_rt.message);
+        try w.writeAll(";\n");
+        try w.writeAll("        pub const Response = ");
+        try ctx.imports.writeSymPath(w, res_rt.message);
+        try w.writeAll(";\n");
+        try w.print("        pub const client_streaming: bool = {};\n", .{rpc.req_stream});
+        try w.print("        pub const server_streaming: bool = {};\n", .{rpc.res_stream});
+        try w.print("        pub const stream_kind: wire.rpc.StreamKind = {s};\n", .{streamKindExpr(rpc.req_stream, rpc.res_stream)});
+        try w.writeAll("    };\n\n");
+    }
+
+    try w.writeAll("    pub const MethodId = enum {\n");
+    for (svc.rpcs) |rpc| {
+        try w.writeAll("        ");
+        try writeIdent(w, rpc.name);
+        try w.writeAll(",\n");
+    }
+    try w.writeAll("    };\n\n");
+
+    try w.writeAll("    pub const methods = .{\n");
+    for (svc.rpcs) |rpc| {
+        try w.writeAll("        ");
+        try writeIdent(w, rpc.name);
+        try w.writeAll(",\n");
+    }
+    try w.writeAll("    };\n\n");
+
+    try w.writeAll("    pub const method_infos: []const wire.rpc.MethodInfo = &.{\n");
+    for (svc.rpcs) |rpc| {
+        try w.writeAll("        .{ .name = \"");
+        try w.writeAll(rpc.name);
+        try w.writeAll("\", .zig_name = \"");
+        try writeRpcZigName(w, rpc.name);
+        try w.print("\", .path = \"/{s}/{s}\", .stream_kind = {s} }},\n", .{
+            svc_full_name,
+            rpc.name,
+            streamKindExpr(rpc.req_stream, rpc.res_stream),
+        });
+    }
+    try w.writeAll("    };\n\n");
+
+    try w.writeAll("    pub fn matchPath(path: []const u8) ?MethodId {\n");
+    if (svc.rpcs.len == 0) {
+        try w.writeAll("        _ = path;\n");
+    } else {
+        for (svc.rpcs) |rpc| {
+            try w.print("        if (wire.rpc.eqlPath(path, \"/{s}/{s}\")) return .", .{ svc_full_name, rpc.name });
+            try writeIdent(w, rpc.name);
+            try w.writeAll(";\n");
+        }
+    }
+    try w.writeAll("        return null;\n");
+    try w.writeAll("    }\n");
+    try w.writeAll("};\n");
 }
