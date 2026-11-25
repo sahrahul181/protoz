@@ -11,11 +11,19 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // 1. Zero-allocation runtime module
+    // 1. Zero-allocation runtime modules (`proto_wire` for generated `.pb.zig`, `protoz` facade for app code)
     const wire_mod = b.addModule("proto_wire", .{
         .root_source_file = b.path("src/wire.zig"),
         .target = target,
         .optimize = optimize,
+    });
+    const protoz_mod = b.addModule("protoz", .{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "proto_wire", .module = wire_mod },
+        },
     });
 
     // 2. Standalone protobuf compiler (zig-protoc)
@@ -157,6 +165,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "proto_wire", .module = wire_mod },
+                .{ .name = "protoz", .module = protoz_mod },
                 .{ .name = "bench_pb", .module = bench_pb.module },
             },
         }),

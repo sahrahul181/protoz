@@ -1317,3 +1317,15 @@ test "codegen: emits typed gRPC service descriptors, paths, and streaming kinds"
     try std.testing.expect(std.mem.indexOf(u8, gen, "pub const stream_kind: wire.rpc.StreamKind = .bidi_streaming;") != null);
     try std.testing.expect(std.mem.indexOf(u8, gen, "pub fn matchPath(path: []const u8) ?MethodId {") != null);
 }
+
+test "protoz: public facade exports compile cleanly alongside generated .pb.zig" {
+    const protoz = @import("protoz");
+    std.testing.refAllDecls(protoz);
+
+    const e = pb.SmallEvent{ .id = 7, .status = 200, .source = "facade" };
+    var frame_buf: [64]u8 = undefined;
+    const frame = try protoz.encodeDelimitedSlice(e, &frame_buf);
+    const decoded = (try protoz.tryDecodeDelimited(pb.SmallEvent, frame, 1024)).?;
+    try std.testing.expectEqual(@as(u64, 7), decoded.msg.id);
+    try std.testing.expectEqualStrings("facade", decoded.msg.source);
+}

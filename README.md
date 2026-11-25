@@ -1,93 +1,20 @@
 # protoz
+
 [![CI](https://github.com/sahrahul181/protoz/actions/workflows/ci.yml/badge.svg)](https://github.com/sahrahul181/protoz/actions/workflows/ci.yml)
-A high-performance, **zero-allocation** Protocol Buffers (`proto3`, `proto2`, and `edition`) compiler and runtime written in pure Zig.
+
+A high-performance, **zero-allocation** Protocol Buffers (`proto2`, `proto3`, and `edition`) compiler and runtime for **Zig 0.17.1**.
 
 ---
 
 ## Highlights
 
-- **Zero Heap Allocations:** Encode, size, decode, validate, iterate repeated fields, query maps, and resolve cyclic submessages with **0 heap allocations**. Strings and byte fields borrow directly from the wire buffer; repeated, map, and cyclic fields use zero-copy views.
-- **Multi-GB/s Wire Throughput:** Up to **66.87 Mops/s** (14.96 ns) on small messages and **3.08 GB/s** decode / **2.69 GB/s** encode on batched payloads in `ReleaseFast` (see [Benchmarks](#benchmarks)).
-- **Single-Pass Reverse Encoding (`ReverseWriter`):** Serializes length-delimited submessages, maps, and packed repeated fields backwards in a single $O(N)$ pass—up to **1.71x faster** than forward streaming with no intermediate buffers.
-- **High-Speed Wire Engine:** Pointer-pair `Reader`, direct `u32` raw-tag switching, 1- and 2-byte varint fast paths, shift-free packed varint validation, direct `.packed_slice` views, tight wire windows, and lossless multi-chunk submessage merging.
-- **Standalone Compiler or Official `protoc` Plugin:**
-  - `zig-protoc`: Pure-Zig standalone compiler with multi-file import resolution, schema validation, and Make `.d` depfile generation (no external `protoc` or C++ toolchain required).
-  - `protoc-gen-zig`: Drop-in plugin for Google's `protoc` and `buf` speaking `CodeGeneratorRequest` / `CodeGeneratorResponse`.
-- **First-Class `build.zig` Integration:** Hermetic helpers (`addProtoModule`, `addProtoPackage`, and `*With` variants), bundled Google Well-Known Types (`include/google/protobuf/` + pre-wired `proto_wkt` module), and automatic transitive rebuild tracking via `.d` depfiles.
-
----
-
-## Table of Contents
-
-- [Supported Features](#supported-features)
-- [Benchmarks](#benchmarks)
-- [Installation](#installation)
-- [Zig Build System Integration](#zig-build-system-integration)
-  - [Single `.proto` File (`addProtoModule`)](#single-proto-file-addprotomodule)
-  - [Multi-File Package with Imports (`addProtoPackage`)](#multi-file-package-with-imports-addprotopackage)
-  - [Pre-Wired Well-Known Types (`proto_wkt`)](#pre-wired-well-known-types-proto_wkt)
-- [Building & Testing](#building--testing)
-- [CLI Usage](#cli-usage)
-  - [1. Standalone Compiler (`zig-protoc`)](#1-standalone-compiler-zig-protoc)
-  - [2. Official `protoc` Plugin (`protoc-gen-zig`)](#2-official-protoc-plugin-protoc-gen-zig)
-- [Runtime Usage](#runtime-usage)
-  - [Encoding (`encodeSlice` & `encode`)](#encoding-encodeslice--encode)
-  - [Decoding & Validation (`decode` & `validateDepth`)](#decoding--validation-decode--validatedepth)
-  - [Repeated Fields, Maps, Oneofs, and Cyclic Messages](#repeated-fields-maps-oneofs-and-cyclic-messages)
-- [Repository Structure](#repository-structure)
-- [License](#license)
-
----
-
-## Supported Features
-
-### Schema & Compiler Frontend
-- **Syntax Support:** `proto3`, `proto2`, and Protobuf `edition` (`2023+` defaults: explicit field presence, packed repeated encoding, UTF-8 verification, plus file/field-level `features.*` overrides).
-- **Full Type System:** All scalar types (`int32`/`64`, `uint32`/`64`, `sint32`/`64` ZigZag, `fixed32`/`64`, `sfixed32`/`64`, `float`, `double`, `bool`, `string`, `bytes`), nested messages and enums, enum aliases (`allow_alias = true`), `oneof` tagged unions, `map<K, V>`, `optional` explicit presence (`proto3_optional`), and self-/mutually-recursive messages (`wire.Lazy(T)`).
-- **Multi-File Imports:** Recursive `-I` include-path resolution with circular-import detection, cross-file relative `@import` generation, cross-file cycle detection, Windows & POSIX path canonicalization, and Make `.d` depfiles with proper space escaping.
-- **Schema Validation & Zig Safety:** Innermost-component scope shadowing, duplicate field number/name detection, `19000..19999` and `reserved` range/name enforcement, `map` key-type enforcement, proto3 enum zero-first and alias checks, automatic Zig keyword escaping (`@"type"`, `@"error"`, etc.), and `oneof`/nested-type collision disambiguation.
-- **Bundled Google Well-Known Types:** Ships standard `google/protobuf/*.proto` definitions (`Any`, `Duration`, `Empty`, `FieldMask`, `Struct`, `Timestamp`, `Wrappers`, `Descriptor`, etc.) automatically wired into `addProtoPackage`.
-
-### Zero-Allocation Wire Runtime
-- **Wire Conformance:** Packed and unpacked repeated decoding, 10-byte sign-extended negative `int32` and non-canonical varints, duplicate submessage merging (including across disjoint multi-chunk envelopes and cyclic `Lazy` fields), duplicate map-value message merging, last-key-wins `Map.get`, last-writer-wins `oneof`, and unknown field / Proto2 `SGROUP`–`EGROUP` skipping.
-- **Safety Guarantees:** Enforces the official 100-level recursion limit (`error.RecursionLimitExceeded`), overflow-safe bounds checks, strict Proto3/Edition UTF-8 validation (`error.InvalidUtf8`), and zero-stack payload validation (`validateDepth`).
-
----
-
-## Benchmarks
-
-Measured with `zig build bench -Doptimize=ReleaseFast` (9 samples per operation, volatile anti-constant-folding barriers, **0 heap allocations**):
-
-| Benchmark | Payload | Median (ns) | Min (ns) | Mops/s | Throughput (MB/s) |
-|---|---:|---:|---:|---:|---:|
-| `Small/encodedSize` | 29 B | 2.82 | 2.82 | 354.04 | 10,267.1 |
-| `Small/encodeSlice` (reverse) | 29 B | 14.96 | 14.94 | 66.87 | 1,939.2 |
-| `Small/encode` (forward) | 29 B | 16.70 | 16.68 | 59.87 | 1,736.3 |
-| `Small/validateDepth` | 29 B | 16.08 | 15.82 | 62.20 | 1,803.8 |
-| `Small/decode` (validate + views) | 29 B | 24.32 | 24.23 | 41.11 | 1,192.3 |
-| `User/encodedSize` | 161 B | 40.18 | 40.00 | 24.89 | 4,006.5 |
-| `User/encodeSlice` (reverse) | 161 B | 107.41 | 107.25 | 9.31 | 1,499.0 |
-| `User/encode` (forward) | 161 B | 155.64 | 154.67 | 6.43 | 1,034.5 |
-| `User/validateDepth` | 161 B | 123.99 | 123.30 | 8.06 | 1,298.4 |
-| `User/decode` (validate + views) | 161 B | 175.80 | 175.06 | 5.69 | 915.8 |
-| `User/decode + full traversal` | 161 B | 386.05 | 383.42 | 2.59 | 417.0 |
-| `Batch/encodedSize` | 3,020 B | 250.24 | 246.71 | 4.00 | 12,068.5 |
-| `Batch/encodeSlice` (reverse) | 3,020 B | 1,123.13 | 1,121.47 | 0.89 | 2,688.9 |
-| `Batch/encode` (forward) | 3,020 B | 1,925.59 | 1,923.20 | 0.52 | 1,568.4 |
-| `Batch/validateDepth` | 3,020 B | 901.12 | 890.50 | 1.11 | 3,351.4 |
-| `Batch/decode` (validate + views) | 3,020 B | 981.34 | 954.15 | 1.02 | 3,077.4 |
-| `Batch/decode + full traversal` | 3,020 B | 2,824.12 | 2,764.94 | 0.35 | 1,069.4 |
-
-- **`Small` (`SmallEvent`):** Flat telemetry event (`uint64`, `int64`, `uint32`, UTF-8 `string`).
-- **`User` (`UserProfile`):** Rich RPC message (packed `repeated uint32`, `repeated string`, `map<string, int32>`, nested message, explicit `optional bool`, `oneof`, cyclic `Lazy` message).
-- **`Batch` (`TelemetryBatch`):** Telemetry batch (128 packed `sint64`, 128 packed `fixed64`, 64 repeated `Point` submessages).
-
-Run locally (supports `--filter`):
-
-```sh
-zig build bench -Doptimize=ReleaseFast
-zig build bench -Doptimize=ReleaseFast -- --filter Batch
-```
+- **Zero Heap Allocations on Decode & Encode:** `Repeated`, `Map`, `Lazy`, and `UnknownFields` operate as compact **32–40 byte** zero-copy views directly over wire slices; strings and bytes borrow directly from the caller buffer.
+- **Multi-GB/s Wire Throughput:** Up to **66.72 Mops/s** (14.99 ns) on small messages and **3.06 GB/s** decode / **2.76 GB/s** encode on batched payloads in `ReleaseFast` (see [Benchmarks](#benchmarks)).
+- **Single-Pass Reverse Serialization (`ReverseWriter`):** `encodeSlice` writes backwards into caller-owned stack or slab buffers in a single pass—**1.76x faster** than forward streaming on batched payloads with no pre-pass size calculation for nested submessages.
+- **On-Demand Decoding:** Comptime `decodeOnly(bytes, .{ .id, .role })` materializes a minimal stack struct and skips unselected fields (**4.4x–6.7x faster** than full decode); `fieldIterator(bytes)` streams fields with early exit (**9.9x faster** on `User`).
+- **Full Protocol Toolkit:** Length-delimited framing (TCP/Unix/WAL), 5-byte gRPC HTTP/2 framing + comptime unary dispatch, zero-allocation ProtoJSON (`encodeJsonSlice` / `decodeJson`), Well-Known Type helpers (`Timestamp`, `Duration`, `Any`), `{f}` debug formatting, opt-in `UnknownFields` pass-through, and arena-backed `cloneOwned` / `cloneMessage`.
+- **Two Compiler Frontends:** Native `zig-protoc` (pure Zig lexer/parser/resolver with `file:line:col` diagnostics, transitive `import public`, and Make `.d` depfiles) and a standard `protoc-gen-zig` plugin for `protoc` / `buf`.
+- **First-Class `build.zig` Integration:** Package manifest exports `@import("protoz")` (application facade), `proto_wire` (slim runtime imported by generated `.pb.zig` files), `proto_wkt` (pre-wired Google Well-Known Types), host `zig-protoc` / `protoc-gen-zig` binaries, and `addProtoModule` / `addProtoPackage` helpers.
 
 ---
 
@@ -95,21 +22,13 @@ zig build bench -Doptimize=ReleaseFast -- --filter Batch
 
 Requires **Zig 0.17.1+**.
 
-Add `protoz` to your project's `build.zig.zon`:
+Add `protoz` to your project with `zig fetch`:
 
 ```sh
-zig fetch --save git+https://github.com/sahrahul181/protoz
+zig fetch --save git+https://github.com/sahrahul181/protoz#v0.1.0
 ```
 
----
-
-## Zig Build System Integration
-
-`protoz` re-exports `addProtoModule`, `addProtoPackage`, `addProtoModuleWith`, and `addProtoPackageWith` directly from its package root (`@import("protoz")`). Always forward `target` and `optimize` to `b.dependency("protoz", .{ ... })` so `proto_wire` compiles for your target and optimization mode.
-
-### Single `.proto` File (`addProtoModule`)
-
-Use `addProtoModule` for standalone `.proto` files with no `import` statements:
+Wire schema compilation in your `build.zig`:
 
 ```zig
 const std = @import("std");
@@ -124,11 +43,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const user_pb = protoz.addProtoModule(b, protoz_dep, .{
-        .proto = b.path("proto/user.proto"),
-        .out_name = "user.pb.zig",
+    const api_pkg = protoz.addProtoPackage(b, protoz_dep, .{
+        .include_dirs = &.{b.path("proto")},
+        .entry_protos = &.{b.path("proto/api.proto")},
+        .out_dir_name = "api_pb",
         .target = target,
         .optimize = optimize,
+        // .preserve_unknown_fields = true, // opt-in proxy pass-through
     });
 
     const exe = b.addExecutable(.{
@@ -138,8 +59,8 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "proto_wire", .module = protoz_dep.module("proto_wire") },
-                .{ .name = "user_pb", .module = user_pb.module },
+                .{ .name = "protoz", .module = protoz_dep.module("protoz") },
+                .{ .name = "api_pb", .module = api_pkg.module },
             },
         }),
     });
@@ -147,225 +68,201 @@ pub fn build(b: *std.Build) void {
 }
 ```
 
-### Multi-File Package with Imports (`addProtoPackage`)
-
-Use `addProtoPackage` whenever schemas import other `.proto` files or Google Well-Known Types. It automatically appends `protoz`'s bundled `include/` path (configurable via `.include_well_known_types = true`), generates a `root.zig` barrel, and tracks all transitive imports with a Make `.d` depfile:
+For standalone single-file `.proto` schemas with no imports, use `protoz.addProtoModule`:
 
 ```zig
-const std = @import("std");
-const protoz = @import("protoz");
-
-pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
-
-    const protoz_dep = b.dependency("protoz", .{
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const orders_pkg = protoz.addProtoPackage(b, protoz_dep, .{
-        .include_dirs = &.{b.path("proto")},
-        .entry_protos = &.{
-            b.path("proto/orders/service.proto"),
-            b.path("proto/orders/models.proto"),
-        },
-        .out_dir_name = "orders_pb",
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const exe = b.addExecutable(.{
-        .name = "orders-service",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "proto_wire", .module = protoz_dep.module("proto_wire") },
-                .{ .name = "orders_pb", .module = orders_pkg.module },
-            },
-        }),
-    });
-    b.installArtifact(exe);
-}
+const user_pb = protoz.addProtoModule(b, protoz_dep, .{
+    .proto = b.path("proto/user.proto"),
+    .out_name = "user.pb.zig",
+    .target = target,
+    .optimize = optimize,
+});
 ```
 
-In your Zig source, access each generated schema through the barrel module (`orders/models.proto` -> `orders_models`):
-
-```zig
-const orders_pb = @import("orders_pb");
-const Order = orders_pb.orders_models.Order;
-```
-
-### Pre-Wired Well-Known Types (`proto_wkt`)
-
-If you only need standard Google Well-Known Types (`Any`, `Duration`, `Empty`, `FieldMask`, `Struct`, `Timestamp`, `Wrappers`), import the pre-wired `proto_wkt` module directly:
+For standard Google Well-Known Types without generating your own schema, depend directly on `protoz_dep.module("proto_wkt")`:
 
 ```zig
 .{ .name = "proto_wkt", .module = protoz_dep.module("proto_wkt") }
 ```
 
-```zig
-const wkt = @import("proto_wkt");
-const ts = wkt.google_protobuf_timestamp.Timestamp{
-    .seconds = 1764075000,
-    .nanos = 500_000_000,
-};
-```
-
----
-
-## Building & Testing
+### Using `protoc-gen-zig` with `protoc`
 
 ```sh
-# Build zig-protoc and protoc-gen-zig into zig-out/bin/
 zig build -Doptimize=ReleaseFast
-
-# Run test suite (including bundled Google Well-Known Types verification)
-zig build test
-
-# Run zero-allocation benchmarks
-zig build bench -Doptimize=ReleaseFast
+protoc --plugin=protoc-gen-zig=./zig-out/bin/protoc-gen-zig \
+  --zig_out=gen \
+  --zig_opt=wire_import=proto_wire,root_file=root.zig,preserve_unknown_fields=false \
+  -I proto -I include proto/api.proto
 ```
 
-Artifacts produced in `zig-out/bin/`:
-- `zig-protoc` (`zig-protoc.exe` on Windows): Standalone compiler CLI
-- `protoc-gen-zig` (`protoc-gen-zig.exe` on Windows): Official `protoc` / `buf` plugin
-
----
-
-## CLI Usage
-
-### 1. Standalone Compiler (`zig-protoc`)
-
-#### Single `.proto` file
-
-```sh
-./zig-out/bin/zig-protoc --out person.pb.zig person.proto
-```
-
-#### Multi-file package with imports & depfile
+Standalone `zig-protoc` also supports `--out <file>`, `--out-dir <dir>`, `--root-file <name>`, `--depfile <file>`, `-I <dir>`, and `--preserve-unknown-fields`:
 
 ```sh
 ./zig-out/bin/zig-protoc \
-    -I proto \
-    -I include \
-    --out-dir generated_pb \
-    --root-file root.zig \
-    --depfile generated_pb/proto.d \
-    proto/service.proto proto/models/user.proto
-```
-
-Flags:
-- `-I <dir>` / `--proto-path <dir>`: Add an import search root (repeatable).
-- `--out <file>`: Emit a single `.pb.zig` file (omit to write to stdout).
-- `--out-dir <dir>`: Emit generated `.pb.zig` files preserving subdirectory structure.
-- `--root-file <name>`: Barrel file emitted inside `--out-dir` (default: `root.zig`).
-- `--depfile <file>`: Emit a Make-format `.d` dependency file for build systems.
-
-### 2. Official `protoc` Plugin (`protoc-gen-zig`)
-
-```sh
-# POSIX
-protoc --plugin=protoc-gen-zig=./zig-out/bin/protoc-gen-zig \
-    -I proto -I include \
-    --zig_out=generated_pb \
-    proto/service.proto
-```
-
-```powershell
-# Windows PowerShell
-protoc --plugin=protoc-gen-zig=.\zig-out\bin\protoc-gen-zig.exe `
-    -I proto -I include `
-    --zig_out=generated_pb `
-    proto/service.proto
+  -I proto -I include \
+  --out-dir generated_pb \
+  --root-file root.zig \
+  --depfile generated_pb/proto.d \
+  proto/api.proto
 ```
 
 ---
 
-## Runtime Usage
+## Quick API Guide
 
-### Encoding (`encodeSlice` & `encode`)
-
-#### Single-Pass Reverse Serialization (`encodeSlice`) — Fastest
-Serializes directly into a caller-supplied buffer in a single backward pass with zero allocations:
+### Encode & Decode (Zero Allocations)
 
 ```zig
-const pb = @import("user_pb");
+const pb = @import("api_pb").api;
 
-const user = pb.User{
-    .id = 1001,
-    .name = "Alice",
-    .scores = .{ .slice = &.{ 10, 20, 300 } },
-    .quotas = .{ .slice = &.{
-        .{ .key = "cpu", .value = 8 },
-        .{ .key = "ram", .value = 32 },
-    } },
-    .contact = .{ .email = "alice@example.com" },
+const user = pb.UserProfile{
+    .id = 42,
+    .name = "alice",
+    .scores = .{ .slice = &.{ 10, 20, 30 } },
+    .quotas = .{ .slice = &.{.{ .key = "cpu", .value = 16 }} },
+    .contact = .{ .email = "alice@acme.dev" },
 };
 
-var buffer: [1024]u8 = undefined;
-const wire_bytes = try user.encodeSlice(&buffer);
-// `wire_bytes` is a slice inside `buffer` of length `user.encodedSize()`.
+var buf: [512]u8 = undefined;
+const wire_bytes = try user.encodeSlice(&buf);
+
+// Full zero-alloc decode (validates wire format + UTF-8, returns zero-copy views)
+const view = try pb.UserProfile.decode(wire_bytes);
+const cpu = try view.quotas.get("cpu"); // ?i32 = 16
 ```
 
-#### Forward Streaming (`encode`)
-Writes sequentially to `*wire.SliceWriter` or any writer providing `writeAll` / `writeByte` (including `*std.Io.Writer`):
+### On-Demand Decoding (`decodeOnly` & `fieldIterator`)
 
 ```zig
-const wire = @import("proto_wire");
+// Materializes only `.id` and `.role` on the stack; skips UTF-8, maps, and submessages.
+const routing = try pb.UserProfile.decodeOnly(wire_bytes, .{ .id, .role });
 
-var stream_buf: [1024]u8 = undefined;
-var sw = wire.SliceWriter.init(&stream_buf);
-try user.encode(&sw);
-const written_bytes = sw.written();
-```
-
-### Decoding & Validation (`decode` & `validateDepth`)
-
-```zig
-const std = @import("std");
-const wire = @import("proto_wire");
-const pb = @import("user_pb");
-
-// Zero-allocation decode: strings/bytes borrow from `wire_bytes`
-const user = try pb.User.decode(wire_bytes);
-std.debug.print("id={d}, name={s}\n", .{ user.id, user.name });
-
-// Zero-stack wire validation (verifies tags, lengths, UTF-8, recursion depth)
-try pb.User.validateDepth(wire_bytes, wire.max_recursion_depth);
-```
-
-### Repeated Fields, Maps, Oneofs, and Cyclic Messages
-
-```zig
-// 1. Repeated fields (packed or unpacked, zero allocations)
-var scores_it = user.scores.iterator();
-while (try scores_it.next()) |score| {
-    std.debug.print("score: {d}\n", .{score});
-}
-
-// 2. Map fields (official last-duplicate-key-wins semantics)
-if (try user.quotas.get("ram")) |ram| {
-    std.debug.print("ram quota: {d}\n", .{ram});
-}
-var quotas_it = user.quotas.iterator();
-while (try quotas_it.next()) |entry| {
-    std.debug.print("{s} = {d}\n", .{ entry.key, entry.value });
-}
-
-// 3. Oneof tagged unions
-if (user.contact) |contact| switch (contact) {
-    .email => |addr| std.debug.print("email: {s}\n", .{addr}),
-    .phone => |num| std.debug.print("phone: {s}\n", .{num}),
+// Streaming cursor with early exit.
+var it = pb.UserProfile.fieldIterator(wire_bytes);
+while (try it.next()) |item| switch (item) {
+    .id => |id| { _ = id; break; },
+    else => {},
 };
+```
 
-// 4. Cyclic messages (`wire.Lazy(T)`) decoded on demand
-if (user.manager) |mgr_lazy| {
-    const mgr = try mgr_lazy.decode();
-    std.debug.print("manager: {s}\n", .{mgr.name});
+### Length-Delimited Framing & Owned Detach
+
+```zig
+const protoz = @import("protoz");
+
+var frame_buf: [256]u8 = undefined;
+const frame = try protoz.encodeDelimitedSlice(user, &frame_buf);
+
+// Streaming-safe: returns `null` on partial TCP buffers, `error.FrameTooLarge` on oversize.
+if (try protoz.tryDecodeDelimited(pb.UserProfile, frame, 64 * 1024)) |f| {
+    // Outlive the network buffer with a single O(1) arena teardown:
+    var owned = try protoz.cloneOwned(allocator, f.msg);
+    defer owned.deinit();
 }
+```
+
+### ProtoJSON & Well-Known Types
+
+```zig
+const wkt = @import("proto_wkt");
+
+// Zero-allocation wire-to-JSON transcoding
+var json_buf: [1024]u8 = undefined;
+const json_text = try view.encodeJsonSlice(&json_buf, .{});
+
+// Zero-copy fast-path decode (flat unescaped messages need 0 arena bytes)
+const from_json = try pb.UserProfile.decodeJson(arena, json_text, .{
+    .ignore_unknown_fields = true,
+});
+
+// Timestamp / Duration / Any helpers (0 heap allocations)
+var ts_buf: [32]u8 = undefined;
+const ts = try wkt.google_protobuf_timestamp.Timestamp.parseRfc3339("2026-11-25T14:41:00.500Z");
+const rfc3339 = try ts.formatRfc3339Buf(&ts_buf);
+
+var any_buf: [512]u8 = undefined;
+const packed_any = try wkt.google_protobuf_any.Any.packSlice(user, &any_buf);
+const unpacked = try packed_any.unpack(pb.UserProfile);
+```
+
+### gRPC Framing & Comptime Unary Dispatch
+
+```zig
+const protoz = @import("protoz");
+
+const resp_frame = try protoz.rpc.dispatchUnaryGrpc(
+    pb.Health,
+    &handler,
+    "/acme.v1.Health/Check",
+    req_grpc_frame,
+    4 * 1024 * 1024,
+    &resp_buf,
+);
+```
+
+---
+
+## Benchmarks
+
+Run the reproducible suite locally (`--filter` supported):
+
+```sh
+zig build bench -Doptimize=ReleaseFast
+zig build bench -Doptimize=ReleaseFast -- --filter Batch
+```
+
+Measured with `zig build bench -Doptimize=ReleaseFast` (9 samples per workload, volatile barriers, **0 heap allocations**):
+
+| Workload | Payload | Median (ns) | Min (ns) | Mops/s | Throughput (MB/s) |
+|---|---:|---:|---:|---:|---:|
+| `Small/encodedSize` | 29 B | 2.82 | 2.82 | 354.24 | 10,272.9 |
+| `Small/encodeSlice (reverse)` | 29 B | 14.99 | 14.96 | 66.72 | 1,934.9 |
+| `Small/encode (forward)` | 29 B | 15.50 | 15.48 | 64.53 | 1,871.5 |
+| `Small/validateDepth` | 29 B | 17.87 | 17.24 | 55.96 | 1,622.8 |
+| `Small/decode (validate + views)` | 29 B | 25.74 | 23.67 | 38.86 | 1,126.8 |
+| `Small/encodeJsonSlice` | 87 B | 75.05 | 74.35 | 13.33 | 1,159.3 |
+| `Small/wire -> JSON transcode` | 87 B | 91.96 | 91.35 | 10.87 | 946.0 |
+| `Small/decodeJson (stack FBA)` | 87 B | 234.70 | 233.21 | 4.26 | 370.7 |
+| `User/encodedSize` | 161 B | 42.55 | 42.40 | 23.50 | 3,783.5 |
+| `User/encodeSlice (reverse)` | 161 B | 103.15 | 102.97 | 9.70 | 1,560.9 |
+| `User/encode (forward)` | 161 B | 137.59 | 136.51 | 7.27 | 1,170.2 |
+| `User/validateDepth` | 161 B | 121.02 | 120.50 | 8.26 | 1,330.3 |
+| `User/decode (validate + views)` | 161 B | 161.61 | 160.70 | 6.19 | 996.3 |
+| `User/decode + full traversal` | 161 B | 324.62 | 323.46 | 3.08 | 496.0 |
+| `User/decodeOnly (id + role)` | 161 B | 36.35 | 36.11 | 27.51 | 4,428.7 |
+| `User/fieldIterator (early-exit)` | 161 B | 16.37 | 15.77 | 61.08 | 9,833.4 |
+| `User/encodeJsonSlice` | 348 B | 421.12 | 418.40 | 2.37 | 826.4 |
+| `User/wire -> JSON transcode` | 348 B | 737.92 | 734.60 | 1.36 | 471.6 |
+| `User/decodeJson (stack FBA)` | 348 B | 1,264.94 | 1,241.49 | 0.79 | 275.1 |
+| `Batch/encodedSize` | 3,020 B | 251.13 | 248.92 | 3.98 | 12,025.5 |
+| `Batch/encodeSlice (reverse)` | 3,020 B | 1,095.87 | 1,094.91 | 0.91 | 2,755.8 |
+| `Batch/encode (forward)` | 3,020 B | 1,930.54 | 1,928.66 | 0.52 | 1,564.3 |
+| `Batch/validateDepth` | 3,020 B | 957.42 | 932.97 | 1.04 | 3,154.3 |
+| `Batch/decode (validate + views)` | 3,020 B | 987.02 | 959.00 | 1.01 | 3,059.7 |
+| `Batch/decode + full traversal` | 3,020 B | 2,666.52 | 2,613.00 | 0.38 | 1,132.6 |
+| `Batch/decodeOnly (host only)` | 3,020 B | 146.52 | 145.82 | 6.83 | 20,611.6 |
+| `Batch/fieldIterator (sum deltas)` | 3,020 B | 315.42 | 314.01 | 3.17 | 9,574.4 |
+| `Batch/encodeJsonSlice` | 7,112 B | 11,020.83 | 10,908.47 | 0.09 | 645.3 |
+| `Batch/wire -> JSON transcode` | 7,112 B | 13,701.77 | 13,598.25 | 0.07 | 519.1 |
+| `Batch/decodeJson (stack FBA)` | 7,112 B | 18,936.27 | 18,722.28 | 0.05 | 375.6 |
+
+- **`Small` (`SmallEvent`):** Flat telemetry event (`uint64`, `int64`, `uint32`, UTF-8 `string`).
+- **`User` (`UserProfile`):** Rich RPC message (`repeated uint32`, `repeated string`, `map<string, int32>`, nested message, explicit `optional bool`, `oneof`, cyclic `Lazy` message). `decodeOnly` is **4.4x faster** and early-exit `fieldIterator` is **9.9x faster** than full `decode`.
+- **`Batch` (`TelemetryBatch`):** 128 packed `sint64`, 128 packed `fixed64`, 64 repeated `Point` submessages. `encodeSlice` is **1.76x faster** than forward `encode`; `decodeOnly` (`host`) is **6.7x faster** than full `decode`.
+
+---
+
+## Testing & Fuzzing
+
+```sh
+# Format check
+zig fmt --check build.zig build_proto.zig src bench tests
+
+# Unit, compiler, WKT, ProtoJSON, gRPC, and unknown-field tests under ReleaseSafe
+zig build test -Doptimize=ReleaseSafe --summary all
+
+# Standalone zero-allocation wire fuzzer (PRNG mutations + structured round-trips)
+zig build fuzz -Doptimize=ReleaseFast -- --iters 5000000
 ```
 
 ---
@@ -373,27 +270,34 @@ if (user.manager) |mgr_lazy| {
 ## Repository Structure
 
 ```text
-├── build.zig                    # Exports proto_wire, proto_wkt, zig-protoc, protoc-gen-zig, test & bench steps
-├── build.zig.zon                # Zig package manifest
-├── build_proto.zig              # Reusable build helpers (addProtoModule, addProtoPackage, *With variants)
+├── build.zig                    # Exports protoz, proto_wire, proto_wkt, zig-protoc, protoc-gen-zig
+├── build.zig.zon                # Zig package manifest (v0.1.0)
+├── build_proto.zig              # Reusable build helpers (addProtoModule, addProtoPackage, *With)
 ├── LICENSE                      # MIT License
 ├── README.md
-├── bench/                       # 3-tier zero-allocation benchmark suite (Small, User, Batch)
+├── bench/                       # 3-tier zero-allocation wire & JSON benchmark suite
 │   ├── bench.proto
 │   └── main.zig
-├── include/                     # Bundled Google Well-Known Types (timestamp.proto, any.proto, etc.)
+├── include/                     # Bundled Google Well-Known Types (google/protobuf/*.proto)
 │   └── google/protobuf/
+├── tests/
+│   └── fuzz.zig                 # Cross-platform malformed-wire + structured round-trip fuzzer
 └── src/
-    ├── ast.zig                  # Typed AST (proto2, proto3, editions, reserved, aliases)
-    ├── codegen.zig              # Zero-allocation Zig 0.17.1 code emitter
+    ├── root.zig                 # Public `@import("protoz")` facade
+    ├── wire.zig                 # Zero-allocation wire runtime (Reader, ReverseWriter, containers, framing)
+    ├── json.zig                 # ProtoJSON encoder/decoder (zero-copy fast path + wire transcoding)
+    ├── wkt.zig                  # Timestamp, Duration, and Any zero-allocation helpers
+    ├── rpc.zig                  # gRPC 5-byte framing and comptime unary dispatch
+    ├── ast.zig                  # Typed AST (proto2, proto3, editions, services)
+    ├── diag.zig                 # Source-located compiler diagnostics (file:line:col)
     ├── lexer.zig                # Spec-compliant tokenizer with line/column tracking
-    ├── loader.zig               # Multi-file import loader & cross-platform path normalization
-    ├── parser.zig               # 3-token lookahead recursive-descent .proto parser
-    ├── plugin.zig               # Google protoc CodeGeneratorRequest/Response codec
-    ├── protoc_gen_zig_main.zig  # Entrypoint for protoc-gen-zig plugin
-    ├── protoc_main.zig          # Entrypoint for standalone zig-protoc CLI
+    ├── parser.zig               # Recursive-descent .proto parser
+    ├── loader.zig               # Multi-file import loader & path canonicalization
     ├── resolver.zig             # Scoped type resolution, cycle detection, and schema validation
-    └── wire.zig                 # Zero-allocation wire runtime (Reader, ReverseWriter, Repeated, Map, Lazy)
+    ├── codegen.zig              # Zero-allocation Zig 0.17.1 code emitter
+    ├── plugin.zig               # Google protoc CodeGeneratorRequest/Response codec
+    ├── protoc_main.zig          # Entrypoint for standalone zig-protoc CLI
+    └── protoc_gen_zig_main.zig  # Entrypoint for protoc-gen-zig plugin
 ```
 
 ---
