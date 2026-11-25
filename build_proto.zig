@@ -5,6 +5,7 @@ pub const ProtoModuleOptions = struct {
     out_name: []const u8,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    preserve_unknown_fields: bool = false,
 };
 
 pub const ProtoArtifact = struct {
@@ -33,6 +34,9 @@ pub fn addProtoModuleWith(
     opts: ProtoModuleOptions,
 ) ProtoArtifact {
     const gen = b.addRunArtifact(protoc_exe);
+    if (opts.preserve_unknown_fields) {
+        gen.addArg("--preserve-unknown-fields");
+    }
     gen.addArg("--out");
     const gen_file = gen.addOutputFileArg(opts.out_name);
     gen.addFileArg(opts.proto);
@@ -56,6 +60,7 @@ pub const ProtoPackageOptions = struct {
     optimize: std.builtin.OptimizeMode,
     /// Automatically appends protoz's bundled `include/` (google/protobuf/*.proto) as a fallback `-I` path.
     include_well_known_types: bool = true,
+    preserve_unknown_fields: bool = false,
 };
 
 pub const ProtoPackageArtifact = struct {
@@ -87,6 +92,9 @@ pub fn addProtoPackageWith(
     opts: ProtoPackageOptions,
 ) ProtoPackageArtifact {
     const gen = b.addRunArtifact(protoc_exe);
+    if (opts.preserve_unknown_fields) {
+        gen.addArg("--preserve-unknown-fields");
+    }
     gen.addArg("--out-dir");
     const out_dir = gen.addOutputDirectoryArg2(opts.out_dir_name, .{});
     gen.addArg("--root-file");

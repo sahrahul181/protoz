@@ -18,6 +18,12 @@ pub const Field = struct {
     name: []const u8,
     number: u29,
     options: []Option,
+    is_group: bool = false,
+};
+
+pub const ExtensionDecl = struct {
+    extendee: []const u8,
+    fields: []Field,
 };
 
 pub const MapField = struct {
@@ -53,6 +59,8 @@ pub const Message = struct {
     nested_enums: []Enum,
     reserved_ranges: []const ReservedRange = &.{},
     reserved_names: []const []const u8 = &.{},
+    extension_ranges: []const ReservedRange = &.{},
+    extensions: []const ExtensionDecl = &.{},
 };
 
 pub const Rpc = struct {
@@ -78,4 +86,5 @@ pub const File = struct {
     messages: []Message,
     enums: []Enum,
     services: []Service,
+    extensions: []const ExtensionDecl = &.{},
 };

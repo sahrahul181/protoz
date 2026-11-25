@@ -1,6 +1,7 @@
 const std = @import("std");
 const lexer = @import("lexer.zig");
 const ast = @import("ast.zig");
+const diag_mod = @import("diag.zig");
 
 pub const ParseError = error{
     UnexpectedToken,
@@ -12,18 +13,31 @@ pub const max_field_number: i32 = 536_870_911;
 
 pub const Parser = struct {
     arena: std.mem.Allocator,
+    file_name: []const u8 = "<input>",
+    diag: ?*diag_mod.Diagnostic = null,
     lex: lexer.Lexer,
     cur: lexer.Token,
     peek1: lexer.Token,
     peek2: lexer.Token,
 
     pub fn parse(arena: std.mem.Allocator, src: []const u8) ParseError!ast.File {
+        return parseWithDiag(arena, "<input>", src, null);
+    }
+
+    pub fn parseWithDiag(
+        arena: std.mem.Allocator,
+        file_name: []const u8,
+        src: []const u8,
+        diag: ?*diag_mod.Diagnostic,
+    ) ParseError!ast.File {
         var lex = lexer.Lexer{ .src = src };
         const t0 = lex.next();
         const t1 = lex.next();
         const t2 = lex.next();
         var p = Parser{
             .arena = arena,
+            .file_name = file_name,
+            .diag = diag,
             .lex = lex,
             .cur = t0,
             .peek1 = t1,
@@ -40,8 +54,27 @@ pub const Parser = struct {
         return prev;
     }
 
+    fn fail(self: *Parser, tok: lexer.Token, comptime fmt: []const u8, args: anytype, err: ParseError) ParseError {
+        if (self.diag) |d| {
+            d.* = .{
+                .file = self.file_name,
+                .line = tok.line,
+                .col = tok.col,
+                .message = std.fmt.allocPrint(self.arena, fmt, args) catch @errorName(err),
+            };
+        }
+        return err;
+    }
+
     fn expect(self: *Parser, kind: lexer.TokenKind) ParseError!lexer.Token {
-        if (self.cur.kind != kind) return error.UnexpectedToken;
+        if (self.cur.kind != kind) {
+            return self.fail(
+                self.cur,
+                "expected {s}, found '{s}'",
+                .{ @tagName(kind), self.cur.text },
+                error.UnexpectedToken,
+            );
+        }
         return self.advance();
     }
 
@@ -242,6 +275,54 @@ pub const Parser = struct {
         _ = try self.expect(.semi);
     }
 
+    fn asciiLower(self: *Parser, text: []const u8) ParseError![]const u8 {
+        const out = try self.arena.alloc(u8, text.len);
+        for (text, 0..) |ch, i| out[i] = std.ascii.toLower(ch);
+        return out;
+    }
+
+    fn parseExtensionRanges(self: *Parser, ranges: *std.ArrayList(ast.ReservedRange)) ParseError!void {
+        _ = self.advance(); // "extensions"
+        while (self.cur.kind != .semi and self.cur.kind != .lbracket and self.cur.kind != .eof) {
+            const start = try self.parseSignedI32();
+            var end = start;
+            if (isIdent(self.cur, "to")) {
+                _ = self.advance();
+                if (isIdent(self.cur, "max")) {
+                    _ = self.advance();
+                    end = max_field_number;
+                } else {
+                    end = try self.parseSignedI32();
+                }
+            }
+            try ranges.append(self.arena, .{ .start = start, .end = end });
+            if (self.cur.kind == .comma) {
+                _ = self.advance();
+            } else break;
+        }
+        _ = try self.parseFieldOptions();
+        _ = try self.expect(.semi);
+    }
+
+    fn parseExtend(self: *Parser, sibling_messages: *std.ArrayList(ast.Message)) ParseError!ast.ExtensionDecl {
+        _ = self.advance(); // "extend"
+        const extendee = try self.parseQualifiedIdent();
+        _ = try self.expect(.lbrace);
+        var fields: std.ArrayList(ast.Field) = .empty;
+        while (self.cur.kind != .rbrace and self.cur.kind != .eof) {
+            if (self.cur.kind == .semi) {
+                _ = self.advance();
+                continue;
+            }
+            try fields.append(self.arena, try self.parseFieldOrGroup(sibling_messages));
+        }
+        _ = try self.expect(.rbrace);
+        return .{
+            .extendee = extendee,
+            .fields = try fields.toOwnedSlice(self.arena),
+        };
+    }
+
     fn parseMessageReserved(
         self: *Parser,
         ranges: *std.ArrayList(ast.ReservedRange),
@@ -284,6 +365,7 @@ pub const Parser = struct {
         var enums: std.ArrayList(ast.Enum) = .empty;
         var services: std.ArrayList(ast.Service) = .empty;
         var public_imports: std.ArrayList(usize) = .empty;
+        var extensions: std.ArrayList(ast.ExtensionDecl) = .empty;
 
         while (self.cur.kind != .eof) {
             if (self.cur.kind == .semi) {
@@ -331,9 +413,7 @@ pub const Parser = struct {
                 _ = self.advance();
                 try services.append(self.arena, try self.parseService());
             } else if (isIdent(self.cur, "extend")) {
-                _ = self.advance();
-                _ = try self.parseQualifiedIdent();
-                try self.skipBalanced(.lbrace, .rbrace);
+                try extensions.append(self.arena, try self.parseExtend(&messages));
             } else {
                 return error.UnexpectedToken;
             }
@@ -348,6 +428,7 @@ pub const Parser = struct {
             .enums = try enums.toOwnedSlice(self.arena),
             .services = try services.toOwnedSlice(self.arena),
             .public_imports = try public_imports.toOwnedSlice(self.arena),
+            .extensions = try extensions.toOwnedSlice(self.arena),
         };
     }
 
@@ -388,6 +469,10 @@ pub const Parser = struct {
 
     fn parseMessage(self: *Parser) ParseError!ast.Message {
         const name = (try self.expect(.ident)).text;
+        return self.parseMessageBody(name);
+    }
+
+    fn parseMessageBody(self: *Parser, name: []const u8) ParseError!ast.Message {
         _ = try self.expect(.lbrace);
 
         var fields: std.ArrayList(ast.Field) = .empty;
@@ -397,6 +482,8 @@ pub const Parser = struct {
         var nested_enums: std.ArrayList(ast.Enum) = .empty;
         var reserved_ranges: std.ArrayList(ast.ReservedRange) = .empty;
         var reserved_names: std.ArrayList([]const u8) = .empty;
+        var extension_ranges: std.ArrayList(ast.ReservedRange) = .empty;
+        var extensions: std.ArrayList(ast.ExtensionDecl) = .empty;
 
         while (self.cur.kind != .rbrace and self.cur.kind != .eof) {
             if (self.cur.kind == .semi) {
@@ -411,7 +498,7 @@ pub const Parser = struct {
                 try nested_enums.append(self.arena, try self.parseEnum());
             } else if (isIdent(self.cur, "oneof") and self.peek1.kind == .ident and self.peek2.kind == .lbrace) {
                 _ = self.advance();
-                try oneofs.append(self.arena, try self.parseOneof());
+                try oneofs.append(self.arena, try self.parseOneof(&nested_messages));
             } else if (isIdent(self.cur, "map") and self.peek1.kind == .langle) {
                 _ = self.advance();
                 try maps.append(self.arena, try self.parseMapField());
@@ -420,18 +507,14 @@ pub const Parser = struct {
             } else if (isIdent(self.cur, "reserved") and self.peek2.kind != .eq) {
                 try self.parseMessageReserved(&reserved_ranges, &reserved_names);
             } else if (isIdent(self.cur, "extensions") and self.peek1.kind == .number) {
-                try self.skipUntilSemi();
+                try self.parseExtensionRanges(&extension_ranges);
             } else if (isIdent(self.cur, "extend") and
                 (self.peek1.kind == .ident or self.peek1.kind == .dot) and
                 self.peek2.kind != .eq)
             {
-                _ = self.advance();
-                _ = try self.parseQualifiedIdent();
-                try self.skipBalanced(.lbrace, .rbrace);
+                try extensions.append(self.arena, try self.parseExtend(&nested_messages));
             } else {
-                if (try self.parseFieldOrGroup()) |f| {
-                    try fields.append(self.arena, f);
-                }
+                try fields.append(self.arena, try self.parseFieldOrGroup(&nested_messages));
             }
         }
         _ = try self.expect(.rbrace);
@@ -445,10 +528,12 @@ pub const Parser = struct {
             .nested_enums = try nested_enums.toOwnedSlice(self.arena),
             .reserved_ranges = try reserved_ranges.toOwnedSlice(self.arena),
             .reserved_names = try reserved_names.toOwnedSlice(self.arena),
+            .extension_ranges = try extension_ranges.toOwnedSlice(self.arena),
+            .extensions = try extensions.toOwnedSlice(self.arena),
         };
     }
 
-    fn parseFieldOrGroup(self: *Parser) ParseError!?ast.Field {
+    fn parseFieldOrGroup(self: *Parser, sibling_messages: *std.ArrayList(ast.Message)) ParseError!ast.Field {
         var label: ast.FieldLabel = .implicit;
         if (isIdent(self.cur, "repeated") and self.peek1.kind != .eq) {
             label = .repeated;
@@ -461,15 +546,23 @@ pub const Parser = struct {
             _ = self.advance();
         }
 
-        // Proto2 group syntax: optional group Name = 1 { ... }
+        // Proto2 group syntax: optional/required/repeated group Name = 1 [opts] { ... }
         if (isIdent(self.cur, "group") and self.peek1.kind == .ident and self.peek2.kind == .eq) {
             _ = self.advance();
-            _ = try self.expect(.ident);
+            const group_name = (try self.expect(.ident)).text;
             _ = try self.expect(.eq);
-            _ = try self.parseFieldNumber();
-            _ = try self.parseFieldOptions();
-            try self.skipBalanced(.lbrace, .rbrace);
-            return null;
+            const number = try self.parseFieldNumber();
+            const opts = try self.parseFieldOptions();
+            const group_msg = try self.parseMessageBody(group_name);
+            try sibling_messages.append(self.arena, group_msg);
+            return .{
+                .label = if (label == .implicit) .optional else label,
+                .type_name = group_name,
+                .name = try self.asciiLower(group_name),
+                .number = number,
+                .options = opts,
+                .is_group = true,
+            };
         }
 
         const type_name = try self.parseQualifiedIdent();
@@ -509,7 +602,7 @@ pub const Parser = struct {
         };
     }
 
-    fn parseOneof(self: *Parser) ParseError!ast.Oneof {
+    fn parseOneof(self: *Parser, sibling_messages: *std.ArrayList(ast.Message)) ParseError!ast.Oneof {
         const name = (try self.expect(.ident)).text;
         _ = try self.expect(.lbrace);
         var fields: std.ArrayList(ast.Field) = .empty;
@@ -520,6 +613,24 @@ pub const Parser = struct {
             }
             if (isIdent(self.cur, "option") and self.peek1.kind != .eq) {
                 _ = try self.parseOptionStmt();
+                continue;
+            }
+            if (isIdent(self.cur, "group") and self.peek1.kind == .ident and self.peek2.kind == .eq) {
+                _ = self.advance();
+                const group_name = (try self.expect(.ident)).text;
+                _ = try self.expect(.eq);
+                const number = try self.parseFieldNumber();
+                const opts = try self.parseFieldOptions();
+                const group_msg = try self.parseMessageBody(group_name);
+                try sibling_messages.append(self.arena, group_msg);
+                try fields.append(self.arena, .{
+                    .label = .optional,
+                    .type_name = group_name,
+                    .name = try self.asciiLower(group_name),
+                    .number = number,
+                    .options = opts,
+                    .is_group = true,
+                });
                 continue;
             }
             const type_name = try self.parseQualifiedIdent();

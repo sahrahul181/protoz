@@ -1,7 +1,26 @@
 const std = @import("std");
 
+pub const wkt = @import("wkt.zig");
+pub const json = @import("json.zig");
+pub const rpc = @import("rpc.zig");
+pub const math = std.math;
+pub const Writer = std.Io.Writer;
+pub const Allocator = std.mem.Allocator;
+pub const CloneError = DecodeError || Allocator.Error;
+
+pub const DelimitedError = DecodeError || error{
+    FrameTooLarge,
+};
+
+pub const ContainerKind = enum {
+    lazy,
+    repeated,
+    map,
+    unknown_fields,
+};
+
 pub const max_recursion_depth: u32 = 100;
-pub const max_merge_chunks: usize = 8;
+pub const max_merge_chunks: usize = 2;
 
 pub const WireType = enum(u3) {
     varint = 0,
@@ -31,6 +50,7 @@ pub const DecodeError = error{
     RecursionLimitExceeded,
     InvalidUtf8,
     MergeChunkLimitExceeded,
+    MissingRequiredField,
 };
 
 pub inline fn rawTag(comptime field_number: u29, comptime wt: WireType) u32 {
@@ -432,6 +452,58 @@ pub const Reader = struct {
             },
         }
     }
+    /// Fast comptime-specialized skip used by `decodeOnly` for unselected fields.
+    pub inline fn skipWireType(self: *Reader, comptime wt: WireType) DecodeError!void {
+        switch (wt) {
+            .varint => _ = try self.readVarint(),
+            .i64 => {
+                if (self.remaining() < 8) return error.UnexpectedEof;
+                self.ptr += 8;
+            },
+            .len => _ = try self.readBytes(),
+            .i32 => {
+                if (self.remaining() < 4) return error.UnexpectedEof;
+                self.ptr += 4;
+            },
+            .sgroup, .egroup => unreachable,
+        }
+    }
+
+    /// Skips an unrecognized field while returning its payload slice.
+    /// For `.len` fields, returns the unwrapped length-delimited payload bytes.
+    pub fn readUnknownField(self: *Reader, tag: Tag, depth: u32) DecodeError!UnknownField {
+        if (tag.wire_type == .len) {
+            return .{
+                .field_number = tag.field_number,
+                .wire_type = .len,
+                .bytes = try self.readBytes(),
+            };
+        }
+        const start = self.ptr;
+        try self.skipField(tag, depth);
+        const len = @intFromPtr(self.ptr) - @intFromPtr(start);
+        return .{
+            .field_number = tag.field_number,
+            .wire_type = tag.wire_type,
+            .bytes = start[0..len],
+        };
+    }
+
+    /// Consumes fields until the matching `EGROUP` tag for `field_number` and returns
+    /// the inner body slice (excluding the closing `EGROUP` tag).
+    pub fn readGroupBytes(self: *Reader, field_number: u29, depth: u32) DecodeError![]const u8 {
+        if (depth == 0) return error.RecursionLimitExceeded;
+        const body_start = self.ptr;
+        while (true) {
+            const tag_start = self.ptr;
+            const tag = (try self.readTag()) orelse return error.UnexpectedEof;
+            if (tag.wire_type == .egroup) {
+                if (tag.field_number != field_number) return error.UnmatchedEndGroup;
+                return body_start[0 .. @intFromPtr(tag_start) - @intFromPtr(body_start)];
+            }
+            try self.skipField(tag, depth - 1);
+        }
+    }
 };
 
 /// Shift-free packed varint validation loop enforcing 10-byte / bit-63 overflow checks.
@@ -463,15 +535,15 @@ inline fn canExtendPtr(prev_ptr: [*]const u8, msg_start: [*]const u8, tag_ptr: [
     return p >= base and p <= t;
 }
 
-/// Inline zero-allocation chunk list preserving disjoint slices across merged submessage chunks.
+/// Compact 2-chunk inline list preserving disjoint slices across merged submessage envelopes.
+/// Contiguous tags within the same buffer always coalesce into a single `.wire` window first.
 pub const WireChunks = struct {
     ptrs: [max_merge_chunks][*]const u8,
     lens: [max_merge_chunks]u32,
     field_number: u29,
-    len: u4,
-    /// Bit `i` is 1 when chunk `i` is a raw payload (packed repeated / Lazy raw),
-    /// and 0 when chunk `i` is a tagged wire window.
-    packed_mask: u8 = 0,
+    len: u2,
+    /// Bit `i` is 1 when chunk `i` is a raw packed payload, 0 when it is a tagged wire window.
+    packed_mask: u2 = 0,
 
     pub inline fn init(field_number: u29) WireChunks {
         return .{
@@ -488,7 +560,7 @@ pub const WireChunks = struct {
     }
 
     pub inline fn isPackedChunk(self: *const WireChunks, idx: usize) bool {
-        return (self.packed_mask & (@as(u8, 1) << @as(u3, @intCast(idx)))) != 0;
+        return (self.packed_mask & (@as(u2, 1) << @as(u1, @intCast(idx)))) != 0;
     }
 
     pub fn append(self: *WireChunks, data: []const u8, is_packed: bool) DecodeError!void {
@@ -497,7 +569,7 @@ pub const WireChunks = struct {
         const idx: usize = self.len;
         self.ptrs[idx] = data.ptr;
         self.lens[idx] = n;
-        if (is_packed) self.packed_mask |= (@as(u8, 1) << @as(u3, @intCast(idx)));
+        if (is_packed) self.packed_mask |= (@as(u2, 1) << @as(u1, @intCast(idx)));
         self.len += 1;
     }
 
@@ -762,31 +834,65 @@ pub fn MessageCodec(comptime M: type) type {
     };
 }
 
-// --- Zero-Allocation Containers: Lazy, Repeated, Map ---
+pub const RawPair = struct {
+    ptrs: [2][*]const u8,
+    lens: [2]u32,
+};
 
-/// Breaks recursive message cycles without heap allocation while preserving multi-occurrence merging.
+/// 32-byte cyclic message view: handles unlimited same-buffer duplicates via `.wire`
+/// and 2 disjoint merged chunks via `.pair`, with zero heap allocations.
 pub fn Lazy(comptime M: type) type {
     @setEvalBranchQuota(100_000);
     return union(enum) {
         raw: []const u8,
         ptr: *const M,
+        raw_wire: PackedSlice,
         wire: WireFieldView,
-        chunks: WireChunks,
-
-        pub fn mergeRaw(self: *@This(), sub_bytes: []const u8, field_number: u29) DecodeError!void {
+        pair: RawPair,
+        pub const _protoz_kind: ContainerKind = .lazy;
+        pub fn mergeRaw(
+            self: *@This(),
+            msg_start: [*]const u8,
+            tag_ptr: [*]const u8,
+            sub_bytes: []const u8,
+            end_ptr: [*]const u8,
+            field_number: u29,
+        ) DecodeError!void {
             @branchHint(.cold);
             switch (self.*) {
+                .raw_wire => |prev| {
+                    if (canExtendPtr(prev.tag_ptr, msg_start, tag_ptr)) {
+                        self.* = .{ .wire = .{
+                            .buf = prev.tag_ptr[0 .. @intFromPtr(end_ptr) - @intFromPtr(prev.tag_ptr)],
+                            .field_number = field_number,
+                        } };
+                    } else {
+                        const n0 = std.math.cast(u32, prev.data.len) orelse return error.UnexpectedEof;
+                        const n1 = std.math.cast(u32, sub_bytes.len) orelse return error.UnexpectedEof;
+                        self.* = .{ .pair = .{
+                            .ptrs = .{ prev.data.ptr, sub_bytes.ptr },
+                            .lens = .{ n0, n1 },
+                        } };
+                    }
+                },
+                .wire => |*prev| {
+                    if (canExtendPtr(prev.buf.ptr, msg_start, tag_ptr)) {
+                        prev.buf = prev.buf.ptr[0 .. @intFromPtr(end_ptr) - @intFromPtr(prev.buf.ptr)];
+                    } else {
+                        return error.MergeChunkLimitExceeded;
+                    }
+                },
                 .raw => |prev| {
-                    var c = WireChunks.init(field_number);
-                    try c.append(prev, true);
-                    try c.append(sub_bytes, true);
-                    self.* = .{ .chunks = c };
+                    const n0 = std.math.cast(u32, prev.len) orelse return error.UnexpectedEof;
+                    const n1 = std.math.cast(u32, sub_bytes.len) orelse return error.UnexpectedEof;
+                    self.* = .{ .pair = .{
+                        .ptrs = .{ prev.ptr, sub_bytes.ptr },
+                        .lens = .{ n0, n1 },
+                    } };
                 },
-                .chunks => |*c| {
-                    try c.append(sub_bytes, true);
-                },
-                .ptr, .wire => {
-                    self.* = .{ .raw = sub_bytes };
+                .pair => return error.MergeChunkLimitExceeded,
+                .ptr => {
+                    self.* = .{ .raw_wire = .{ .data = sub_bytes, .tag_ptr = tag_ptr } };
                 },
             }
         }
@@ -798,14 +904,18 @@ pub fn Lazy(comptime M: type) type {
         pub fn decodeDepth(self: @This(), depth: u32) DecodeError!M {
             return switch (self) {
                 .raw => |b| M.decodeDepth(b, depth),
+                .raw_wire => |rw_slice| M.decodeDepth(rw_slice.data, depth),
                 .ptr => |p| p.*,
                 .wire => |w| blk: {
                     var msg: M = .{};
                     var r = Reader.init(w.buf);
-                    const expected_raw: u32 = (@as(u32, w.field_number) << 3) | @backingInt(WireType.len);
+                    const expected_len: u32 = (@as(u32, w.field_number) << 3) | @backingInt(WireType.len);
+                    const expected_grp: u32 = (@as(u32, w.field_number) << 3) | @backingInt(WireType.sgroup);
                     while (try r.readRawTag()) |raw_tag| {
-                        if (raw_tag == expected_raw) {
+                        if (raw_tag == expected_len) {
                             try msg.mergeDepth(try r.readBytes(), depth);
+                        } else if (raw_tag == expected_grp) {
+                            try msg.mergeDepth(try r.readGroupBytes(w.field_number, depth), depth);
                         } else {
                             const tag = try decodeTag(raw_tag);
                             try r.skipField(tag, depth);
@@ -813,11 +923,10 @@ pub fn Lazy(comptime M: type) type {
                     }
                     break :blk msg;
                 },
-                .chunks => |c| blk: {
+                .pair => |pr| blk: {
                     var msg: M = .{};
-                    for (0..c.len) |i| {
-                        try msg.mergeDepth(c.sliceAt(i), depth);
-                    }
+                    try msg.mergeDepth(pr.ptrs[0][0..pr.lens[0]], depth);
+                    try msg.mergeDepth(pr.ptrs[1][0..pr.lens[1]], depth);
                     break :blk msg;
                 },
             };
@@ -826,26 +935,52 @@ pub fn Lazy(comptime M: type) type {
         pub fn encodedSize(self: @This()) usize {
             return switch (self) {
                 .raw => |b| b.len,
+                .raw_wire => |rw_slice| rw_slice.data.len,
                 .ptr => |p| p.encodedSize(),
-                .wire => (self.decode() catch return 0).encodedSize(),
-                .chunks => |c| blk: {
+                .wire => |w| blk: {
                     var total: usize = 0;
-                    for (0..c.len) |i| total += c.lens[i];
+                    var r = Reader.init(w.buf);
+                    const expected_len: u32 = (@as(u32, w.field_number) << 3) | @backingInt(WireType.len);
+                    const expected_grp: u32 = (@as(u32, w.field_number) << 3) | @backingInt(WireType.sgroup);
+                    while (r.readRawTag() catch return 0) |raw_tag| {
+                        if (raw_tag == expected_len) {
+                            total += (r.readBytes() catch return 0).len;
+                        } else if (raw_tag == expected_grp) {
+                            total += (r.readGroupBytes(w.field_number, max_recursion_depth) catch return 0).len;
+                        } else {
+                            const tag = decodeTag(raw_tag) catch return 0;
+                            r.skipField(tag, max_recursion_depth) catch return 0;
+                        }
+                    }
                     break :blk total;
                 },
+                .pair => |pr| @as(usize, pr.lens[0]) + @as(usize, pr.lens[1]),
             };
         }
 
         pub fn encode(self: @This(), w: anytype) WriterError(@TypeOf(w))!void {
             switch (self) {
                 .raw => |b| try w.writeAll(b),
+                .raw_wire => |rw_slice| try w.writeAll(rw_slice.data),
                 .ptr => |p| try p.encode(w),
-                .wire => {
-                    const merged = self.decode() catch unreachable;
-                    try merged.encode(w);
+                .wire => |wf| {
+                    var r = Reader.init(wf.buf);
+                    const expected_len: u32 = (@as(u32, wf.field_number) << 3) | @backingInt(WireType.len);
+                    const expected_grp: u32 = (@as(u32, wf.field_number) << 3) | @backingInt(WireType.sgroup);
+                    while (r.readRawTag() catch unreachable) |raw_tag| {
+                        if (raw_tag == expected_len) {
+                            try w.writeAll(r.readBytes() catch unreachable);
+                        } else if (raw_tag == expected_grp) {
+                            try w.writeAll(r.readGroupBytes(wf.field_number, max_recursion_depth) catch unreachable);
+                        } else {
+                            const tag = decodeTag(raw_tag) catch unreachable;
+                            r.skipField(tag, max_recursion_depth) catch unreachable;
+                        }
+                    }
                 },
-                .chunks => |c| {
-                    for (0..c.len) |i| try w.writeAll(c.sliceAt(i));
+                .pair => |pr| {
+                    try w.writeAll(pr.ptrs[0][0..pr.lens[0]]);
+                    try w.writeAll(pr.ptrs[1][0..pr.lens[1]]);
                 },
             }
         }
@@ -853,17 +988,18 @@ pub fn Lazy(comptime M: type) type {
         pub fn encodeReverse(self: @This(), rw: *ReverseWriter) EncodeError!void {
             switch (self) {
                 .raw => |b| try rw.writeAll(b),
+                .raw_wire => |rw_slice| try rw.writeAll(rw_slice.data),
                 .ptr => |p| try p.encodeReverse(rw),
                 .wire => {
-                    const merged = self.decode() catch unreachable;
-                    try merged.encodeReverse(rw);
+                    const sz = self.encodedSize();
+                    if (sz == 0) return;
+                    const dst = try rw.reserve(sz);
+                    var sw = SliceWriter.init(dst);
+                    try self.encode(&sw);
                 },
-                .chunks => |c| {
-                    var i: usize = c.len;
-                    while (i > 0) {
-                        i -= 1;
-                        try rw.writeAll(c.sliceAt(i));
-                    }
+                .pair => |pr| {
+                    try rw.writeAll(pr.ptrs[1][0..pr.lens[1]]);
+                    try rw.writeAll(pr.ptrs[0][0..pr.lens[0]]);
                 },
             }
         }
@@ -889,7 +1025,7 @@ pub fn Repeated(comptime Codec: type) type {
         packed_slice: PackedSlice,
         wire: WireFieldView,
         chunks: WireChunks,
-
+        pub const _protoz_kind: ContainerKind = .repeated;
         pub const empty: @This() = .{ .slice = &.{} };
 
         pub const Iterator = struct {
@@ -1299,7 +1435,7 @@ pub fn Map(comptime KCodec: type, comptime VCodec: type) type {
         slice: []const Entry,
         wire: WireFieldView,
         chunks: WireChunks,
-
+        pub const _protoz_kind: ContainerKind = .map;
         pub const Entry = struct {
             key: KCodec.T,
             value: VCodec.T,
@@ -1307,31 +1443,31 @@ pub fn Map(comptime KCodec: type, comptime VCodec: type) type {
 
         pub const empty: @This() = .{ .slice = &.{} };
 
-        fn decodeEntry(bytes: []const u8, depth: u32) DecodeError!Entry {
-            if (depth == 0) return error.RecursionLimitExceeded;
-            var entry: Entry = .{
-                .key = KCodec.default_value,
-                .value = VCodec.default_value,
-            };
-            var r = Reader.init(bytes);
-            const key_tag = comptime rawTag(1, KCodec.wire_type);
-            const val_tag = comptime rawTag(2, VCodec.wire_type);
-            while (try r.readRawTag()) |raw_tag| {
-                if (raw_tag == key_tag) {
-                    entry.key = try KCodec.read(&r, depth - 1);
-                } else if (raw_tag == val_tag) {
-                    if (comptime VCodec.is_message) {
-                        try VCodec.mergeRead(&entry.value, &r, depth - 1);
-                    } else {
-                        entry.value = try VCodec.read(&r, depth - 1);
-                    }
-                } else {
-                    const tag = try decodeTag(raw_tag);
-                    if (tag.field_number == 1 or tag.field_number == 2) return error.WireTypeMismatch;
-                    try r.skipField(tag, depth - 1);
+        pub fn decodeEntry(entry_bytes: []const u8, depth: u32) DecodeError!Entry {
+            const Key = @FieldType(Entry, "key");
+            const Val = @FieldType(Entry, "value");
+            var key: Key = codecDefault(Key);
+            var value: Val = codecDefault(Val);
+            var r = Reader.init(entry_bytes);
+            while (try r.readTag()) |tag| {
+                switch (tag.field_number) {
+                    1 => {
+                        if (tag.wire_type != KCodec.wire_type) return error.WireTypeMismatch;
+                        key = try KCodec.read(&r, depth);
+                    },
+                    2 => {
+                        if (tag.wire_type != VCodec.wire_type) return error.WireTypeMismatch;
+                        if (comptime @typeInfo(Val) == .@"struct" and @hasDecl(Val, "mergeDepth")) {
+                            if (depth == 0) return error.RecursionLimitExceeded;
+                            try value.mergeDepth(try r.readBytes(), depth - 1);
+                        } else {
+                            value = try VCodec.read(&r, depth);
+                        }
+                    },
+                    else => try r.skipField(tag, depth),
                 }
             }
-            return entry;
+            return .{ .key = key, .value = value };
         }
 
         /// Zero-struct entry validator using raw tags and skip-validation.
@@ -1631,6 +1767,963 @@ pub fn Map(comptime KCodec: type, comptime VCodec: type) type {
                     try self.encode(field_number, &sw);
                 },
             }
+        }
+    };
+}
+
+// --- Length-Delimited Message Framing (TCP/Unix streams, WALs, .binpb) ---
+
+pub fn DelimitedFrame(comptime M: type) type {
+    return struct {
+        msg: M,
+        consumed: usize,
+        rest: []const u8,
+    };
+}
+
+/// Exact byte length of a varint-length-prefixed message frame.
+pub inline fn encodedDelimitedSize(msg: anytype) usize {
+    const body = msg.encodedSize();
+    return varintSize(body) + body;
+}
+
+/// Single-pass reverse serialization of a length-delimited message frame into `buf`.
+pub fn encodeDelimitedSlice(msg: anytype, buf: []u8) EncodeError![]const u8 {
+    var rw = ReverseWriter.init(buf);
+    const end = rw.pos;
+    try msg.encodeReverse(&rw);
+    try rw.writeVarint(end - rw.pos);
+    return rw.written();
+}
+
+/// Forward-streaming serialization of a length-delimited message frame to any writer.
+pub fn encodeDelimited(msg: anytype, w: anytype) WriterError(@TypeOf(w))!void {
+    const body = msg.encodedSize();
+    try writeVarint(w, body);
+    try msg.encode(w);
+}
+
+/// Streaming-safe decoder for partial network/file buffers.
+/// - Returns `null` when more bytes are needed (empty buffer, partial length varint, or incomplete body).
+/// - Returns `error.FrameTooLarge` immediately if the declared length exceeds `max_frame_bytes`.
+/// - Returns `DecodeError` if the varint overflows or the complete frame payload is invalid protobuf.
+pub fn tryDecodeDelimited(
+    comptime M: type,
+    buf: []const u8,
+    max_frame_bytes: usize,
+) DelimitedError!?DelimitedFrame(M) {
+    if (buf.len == 0) return null;
+    var r = Reader.init(buf);
+    const frame_len_u64 = r.readVarint() catch |err| switch (err) {
+        error.UnexpectedEof => return null,
+        else => return err,
+    };
+    const frame_len = std.math.cast(usize, frame_len_u64) orelse return error.FrameTooLarge;
+    if (frame_len > max_frame_bytes) return error.FrameTooLarge;
+    if (frame_len > r.remaining()) return null;
+
+    const payload = r.ptr[0..frame_len];
+    r.ptr += frame_len;
+    const consumed = @intFromPtr(r.ptr) - @intFromPtr(buf.ptr);
+    return .{
+        .msg = try M.decode(payload),
+        .consumed = consumed,
+        .rest = buf[consumed..],
+    };
+}
+
+/// Strict decoder for complete length-delimited buffers (returns `error.UnexpectedEof` on truncation).
+pub fn decodeDelimitedSlice(comptime M: type, buf: []const u8) DecodeError!DelimitedFrame(M) {
+    var r = Reader.init(buf);
+    const payload = try r.readBytes();
+    const consumed = @intFromPtr(r.ptr) - @intFromPtr(buf.ptr);
+    return .{
+        .msg = try M.decode(payload),
+        .consumed = consumed,
+        .rest = buf[consumed..],
+    };
+}
+
+/// Zero-allocation iterator over a buffer containing consecutive length-delimited messages.
+pub fn DelimitedIterator(comptime M: type) type {
+    return struct {
+        rest: []const u8,
+
+        pub inline fn init(buf: []const u8) @This() {
+            return .{ .rest = buf };
+        }
+
+        pub fn next(self: *@This()) DecodeError!?M {
+            if (self.rest.len == 0) return null;
+            const frame = try decodeDelimitedSlice(M, self.rest);
+            self.rest = frame.rest;
+            return frame.msg;
+        }
+    };
+}
+
+// --- Zero-Allocation Debug Formatting (`{f}`) ---
+
+pub fn formatMessage(msg: anytype, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    return formatValue(msg, w, 16);
+}
+
+fn writeQuotedBytes(w: *std.Io.Writer, bytes: []const u8) std.Io.Writer.Error!void {
+    try w.writeByte('"');
+    for (bytes) |b| {
+        switch (b) {
+            '"' => try w.writeAll("\\\""),
+            '\\' => try w.writeAll("\\\\"),
+            '\n' => try w.writeAll("\\n"),
+            '\r' => try w.writeAll("\\r"),
+            '\t' => try w.writeAll("\\t"),
+            0x20...0x21, 0x23...0x5B, 0x5D...0x7E => try w.writeByte(b),
+            else => try w.print("\\x{x:0>2}", .{b}),
+        }
+    }
+    try w.writeByte('"');
+}
+
+fn formatValue(val: anytype, w: *std.Io.Writer, depth: u32) std.Io.Writer.Error!void {
+    @setEvalBranchQuota(100_000);
+    const T = @TypeOf(val);
+
+    if (@typeInfo(T) == .@"union" and @hasDecl(T, "_protoz_kind")) {
+        switch (T._protoz_kind) {
+            .lazy => {
+                if (depth == 0) {
+                    try w.writeAll("{...}");
+                    return;
+                }
+                const sub = val.decodeDepth(depth) catch {
+                    try w.writeAll("<invalid-lazy>");
+                    return;
+                };
+                return formatValue(sub, w, depth - 1);
+            },
+            .repeated => {
+                try w.writeByte('[');
+                var it = val.iterator();
+                var first = true;
+                while (true) {
+                    const maybe_item = it.next() catch {
+                        if (!first) try w.writeAll(", ");
+                        try w.writeAll("<invalid>");
+                        break;
+                    };
+                    const item = maybe_item orelse break;
+                    if (!first) try w.writeAll(", ");
+                    try formatValue(item, w, depth);
+                    first = false;
+                }
+                try w.writeByte(']');
+                return;
+            },
+            .map => {
+                try w.writeByte('{');
+                var it = val.iterator();
+                var first = true;
+                while (true) {
+                    const maybe_entry = it.next() catch {
+                        if (!first) try w.writeAll(", ");
+                        try w.writeAll("<invalid>");
+                        break;
+                    };
+                    const entry = maybe_entry orelse break;
+                    if (!first) try w.writeAll(", ");
+                    try formatValue(entry.key, w, depth);
+                    try w.writeAll(": ");
+                    try formatValue(entry.value, w, depth);
+                    first = false;
+                }
+                try w.writeByte('}');
+                return;
+            },
+            .unknown_fields => {
+                try val.formatWithKnown(&.{}, w);
+                return;
+            },
+        }
+    }
+
+    switch (@typeInfo(T)) {
+        .optional => {
+            if (val) |inner| {
+                try formatValue(inner, w, depth);
+            } else {
+                try w.writeAll("null");
+            }
+        },
+        .bool => try w.writeAll(if (val) "true" else "false"),
+        .int, .float => try w.print("{d}", .{val}),
+        .@"enum" => |e| {
+            const raw = @backingInt(val);
+            inline for (e.field_names, e.field_values) |ename, ev| {
+                if (raw == ev) {
+                    try w.writeAll(ename);
+                    return;
+                }
+            }
+            try w.print("{d}", .{raw});
+        },
+        .pointer => |p| {
+            if (p.size == .slice and p.child == u8) {
+                try writeQuotedBytes(w, val);
+            } else {
+                try formatValue(val.*, w, depth);
+            }
+        },
+        .@"union" => {
+            switch (val) {
+                inline else => |payload, tag| {
+                    try w.writeAll("{ ");
+                    try w.writeAll(@tagName(tag));
+                    try w.writeAll(": ");
+                    try formatValue(payload, w, depth);
+                    try w.writeAll(" }");
+                },
+            }
+        },
+        .@"struct" => |st| {
+            if (depth == 0) {
+                try w.writeAll("{...}");
+                return;
+            }
+            try w.writeByte('{');
+            var first = true;
+            inline for (st.field_names, st.field_types) |fname, FT| {
+                const fv = @field(val, fname);
+                const omit = blk: {
+                    if (@typeInfo(FT) == .optional) break :blk (fv == null);
+                    if (FT == UnknownFields) {
+                        if (@hasDecl(T, "_protoz_known_fields")) {
+                            break :blk (fv.encodedSize(T._protoz_known_fields) == 0);
+                        }
+                        break :blk fv.isEmpty();
+                    }
+                    if (@typeInfo(FT) == .@"union" and @hasDecl(FT, "_protoz_kind")) {
+                        if (FT._protoz_kind == .repeated or FT._protoz_kind == .map) {
+                            break :blk (fv == .slice and fv.slice.len == 0);
+                        }
+                    }
+                    break :blk false;
+                };
+                if (!omit) {
+                    try w.writeAll(if (first) " " else ", ");
+                    try w.writeAll(fname);
+                    try w.writeAll(": ");
+                    if (FT == UnknownFields and @hasDecl(T, "_protoz_known_fields")) {
+                        try fv.formatWithKnown(T._protoz_known_fields, w);
+                    } else {
+                        try formatValue(fv, w, depth - 1);
+                    }
+                    first = false;
+                }
+            }
+            if (!first) try w.writeByte(' ');
+            try w.writeByte('}');
+        },
+        else => try w.print("{any}", .{val}),
+    }
+}
+
+// --- On-Demand Streaming & Comptime Selective Projection ---
+
+pub const UnknownField = struct {
+    field_number: u29,
+    wire_type: WireType,
+    bytes: []const u8,
+};
+
+fn codecDefault(comptime T: type) T {
+    return switch (@typeInfo(T)) {
+        .bool => false,
+        .int, .float => 0,
+        .@"enum" => @fromBackingInt(0),
+        .@"struct" => .{},
+        .pointer => |p| if (p.size == .slice and p.child == u8) "" else @compileError("unsupported map codec type"),
+        else => @compileError("unsupported map codec type"),
+    };
+}
+
+/// Lightweight 24-byte streaming view over one wire occurrence of a packable repeated field.
+/// Handles both packed LEN chunks and unpacked single elements uniformly via `.iterator()`.
+pub fn PackedChunk(comptime Codec: type) type {
+    const Elem = @typeInfo(@FieldType(Repeated(Codec), "slice")).pointer.child;
+    return union(enum) {
+        single: Elem,
+        @"packed": []const u8,
+
+        pub const Iterator = struct {
+            mode: union(enum) {
+                single: ?Elem,
+                @"packed": Reader,
+            },
+
+            pub fn next(self: *@This()) DecodeError!?Elem {
+                switch (self.mode) {
+                    .single => |*val| {
+                        const out = val.* orelse return null;
+                        val.* = null;
+                        return out;
+                    },
+                    .@"packed" => |*r| {
+                        if (r.eof()) return null;
+                        return try Codec.read(r, max_recursion_depth);
+                    },
+                }
+            }
+        };
+
+        pub inline fn iterator(self: @This()) Iterator {
+            return switch (self) {
+                .single => |v| .{ .mode = .{ .single = v } },
+                .@"packed" => |b| .{ .mode = .{ .@"packed" = Reader.init(b) } },
+            };
+        }
+    };
+}
+
+// --- Opt-In Unknown-Field Preservation (Zero-Allocation Proxy Pass-Through) ---
+
+pub const UnknownChunks = struct {
+    ptrs: [max_merge_chunks][*]const u8,
+    lens: [max_merge_chunks]u32,
+    len: u2,
+    /// Bit `i` is 1 when chunk `i` is a filtered window (may contain known tags), 0 when pure raw unknown bytes.
+    window_mask: u2 = 0,
+
+    pub inline fn init() UnknownChunks {
+        return .{
+            .ptrs = undefined,
+            .lens = undefined,
+            .len = 0,
+            .window_mask = 0,
+        };
+    }
+
+    pub inline fn sliceAt(self: *const UnknownChunks, idx: usize) []const u8 {
+        return self.ptrs[idx][0..self.lens[idx]];
+    }
+
+    pub inline fn isWindowChunk(self: *const UnknownChunks, idx: usize) bool {
+        return (self.window_mask & (@as(u2, 1) << @as(u1, @intCast(idx)))) != 0;
+    }
+
+    pub fn append(self: *UnknownChunks, data: []const u8, is_window: bool) DecodeError!void {
+        if (self.len >= max_merge_chunks) return error.MergeChunkLimitExceeded;
+        const n = std.math.cast(u32, data.len) orelse return error.UnexpectedEof;
+        const idx: usize = self.len;
+        self.ptrs[idx] = data.ptr;
+        self.lens[idx] = n;
+        if (is_window) self.window_mask |= (@as(u2, 1) << @as(u1, @intCast(idx)));
+        self.len += 1;
+    }
+
+    pub fn tryExtendLast(
+        self: *UnknownChunks,
+        msg_start: [*]const u8,
+        tag_ptr: [*]const u8,
+        end_ptr: [*]const u8,
+    ) DecodeError!bool {
+        if (self.len == 0) return false;
+        const last_idx: usize = self.len - 1;
+        const prev_ptr = self.ptrs[last_idx];
+        const prev_len: usize = self.lens[last_idx];
+        if (!self.isWindowChunk(last_idx) and @intFromPtr(prev_ptr) + prev_len == @intFromPtr(tag_ptr)) {
+            const new_len = @intFromPtr(end_ptr) - @intFromPtr(prev_ptr);
+            self.lens[last_idx] = std.math.cast(u32, new_len) orelse return error.UnexpectedEof;
+            return true;
+        }
+        if (canExtendPtr(prev_ptr, msg_start, tag_ptr)) {
+            const new_len = @intFromPtr(end_ptr) - @intFromPtr(prev_ptr);
+            self.lens[last_idx] = std.math.cast(u32, new_len) orelse return error.UnexpectedEof;
+            self.window_mask |= (@as(u2, 1) << @as(u1, @intCast(last_idx)));
+            return true;
+        }
+        return false;
+    }
+};
+
+/// 40-byte zero-allocation view preserving unrecognized wire fields for proxy pass-through.
+pub const UnknownFields = union(enum) {
+    empty,
+    /// Pure contiguous unknown wire spans (tag + payload); O(1) size and re-encode.
+    raw: []const u8,
+    /// Single-buffer slice spanning first..last unknown tag (may contain interleaved known fields).
+    window: []const u8,
+    /// Up to 2 disjoint chunks from `mergeDepth` across separate wire buffers.
+    chunks: UnknownChunks,
+
+    pub const _protoz_kind: ContainerKind = .unknown_fields;
+
+    pub inline fn isEmpty(self: UnknownFields) bool {
+        return switch (self) {
+            .empty => true,
+            .raw => |b| b.len == 0,
+            .window => |w| w.len == 0,
+            .chunks => |c| c.len == 0,
+        };
+    }
+
+    pub fn record(
+        self: *UnknownFields,
+        msg_start: [*]const u8,
+        tag_ptr: [*]const u8,
+        end_ptr: [*]const u8,
+    ) DecodeError!void {
+        @branchHint(.cold);
+        const span_len = @intFromPtr(end_ptr) - @intFromPtr(tag_ptr);
+        const span = tag_ptr[0..span_len];
+        switch (self.*) {
+            .empty => {
+                self.* = .{ .raw = span };
+            },
+            .raw => |*prev| {
+                if (@intFromPtr(prev.ptr) + prev.len == @intFromPtr(tag_ptr)) {
+                    prev.* = prev.ptr[0 .. prev.len + span_len];
+                } else if (canExtendPtr(prev.ptr, msg_start, tag_ptr)) {
+                    self.* = .{ .window = prev.ptr[0 .. @intFromPtr(end_ptr) - @intFromPtr(prev.ptr)] };
+                } else {
+                    var c = UnknownChunks.init();
+                    try c.append(prev.*, false);
+                    try c.append(span, false);
+                    self.* = .{ .chunks = c };
+                }
+            },
+            .window => |*prev| {
+                if (canExtendPtr(prev.ptr, msg_start, tag_ptr)) {
+                    prev.* = prev.ptr[0 .. @intFromPtr(end_ptr) - @intFromPtr(prev.ptr)];
+                } else {
+                    var c = UnknownChunks.init();
+                    try c.append(prev.*, true);
+                    try c.append(span, false);
+                    self.* = .{ .chunks = c };
+                }
+            },
+            .chunks => |*c| {
+                if (try c.tryExtendLast(msg_start, tag_ptr, end_ptr)) return;
+                try c.append(span, false);
+            },
+        }
+    }
+
+    inline fn isKnownField(comptime known_fields: []const u29, field_number: u29) bool {
+        if (comptime known_fields.len == 0) return false;
+        inline for (known_fields) |kf| {
+            if (field_number == kf) return true;
+        }
+        return false;
+    }
+
+    fn windowEncodedSize(win: []const u8, comptime known_fields: []const u29) usize {
+        @setEvalBranchQuota(100_000);
+        var total: usize = 0;
+        var r = Reader.init(win);
+        while (true) {
+            const start = r.ptr;
+            const raw_tag = (r.readRawTag() catch return 0) orelse break;
+            const tag = decodeTag(raw_tag) catch return 0;
+            r.skipField(tag, max_recursion_depth) catch return 0;
+            if (!isKnownField(known_fields, tag.field_number)) {
+                total += @intFromPtr(r.ptr) - @intFromPtr(start);
+            }
+        }
+        return total;
+    }
+
+    fn writeWindow(win: []const u8, comptime known_fields: []const u29, w: anytype) WriterError(@TypeOf(w))!void {
+        @setEvalBranchQuota(100_000);
+        var r = Reader.init(win);
+        while (true) {
+            const start = r.ptr;
+            const raw_tag = (r.readRawTag() catch unreachable) orelse break;
+            const tag = decodeTag(raw_tag) catch unreachable;
+            r.skipField(tag, max_recursion_depth) catch unreachable;
+            if (!isKnownField(known_fields, tag.field_number)) {
+                const len = @intFromPtr(r.ptr) - @intFromPtr(start);
+                try w.writeAll(start[0..len]);
+            }
+        }
+    }
+
+    pub fn encodedSize(self: UnknownFields, comptime known_fields: []const u29) usize {
+        return switch (self) {
+            .empty => 0,
+            .raw => |b| b.len,
+            .window => |win| windowEncodedSize(win, known_fields),
+            .chunks => |c| blk: {
+                var total: usize = 0;
+                for (0..c.len) |i| {
+                    const s = c.sliceAt(i);
+                    total += if (c.isWindowChunk(i)) windowEncodedSize(s, known_fields) else s.len;
+                }
+                break :blk total;
+            },
+        };
+    }
+
+    pub fn encode(self: UnknownFields, comptime known_fields: []const u29, w: anytype) WriterError(@TypeOf(w))!void {
+        switch (self) {
+            .empty => {},
+            .raw => |b| try w.writeAll(b),
+            .window => |win| try writeWindow(win, known_fields, w),
+            .chunks => |c| {
+                for (0..c.len) |i| {
+                    const s = c.sliceAt(i);
+                    if (c.isWindowChunk(i)) {
+                        try writeWindow(s, known_fields, w);
+                    } else {
+                        try w.writeAll(s);
+                    }
+                }
+            },
+        }
+    }
+
+    pub fn encodeReverse(self: UnknownFields, comptime known_fields: []const u29, rw: *ReverseWriter) EncodeError!void {
+        switch (self) {
+            .empty => {},
+            .raw => |b| try rw.writeAll(b),
+            .window => |win| {
+                const sz = windowEncodedSize(win, known_fields);
+                if (sz == 0) return;
+                const dst = try rw.reserve(sz);
+                var sw = SliceWriter.init(dst);
+                try writeWindow(win, known_fields, &sw);
+            },
+            .chunks => |c| {
+                var i: usize = c.len;
+                while (i > 0) {
+                    i -= 1;
+                    const s = c.sliceAt(i);
+                    if (c.isWindowChunk(i)) {
+                        const sz = windowEncodedSize(s, known_fields);
+                        if (sz == 0) continue;
+                        const dst = try rw.reserve(sz);
+                        var sw = SliceWriter.init(dst);
+                        try writeWindow(s, known_fields, &sw);
+                    } else {
+                        try rw.writeAll(s);
+                    }
+                }
+            },
+        }
+    }
+
+    /// Compacts any `.window` or `.chunks` view into a single owned `.raw` slice.
+    pub fn cloneCompact(
+        self: UnknownFields,
+        allocator: Allocator,
+        comptime known_fields: []const u29,
+    ) CloneError!UnknownFields {
+        const sz = self.encodedSize(known_fields);
+        if (sz == 0) return .empty;
+        const buf = try allocator.alloc(u8, sz);
+        var sw = SliceWriter.init(buf);
+        self.encode(known_fields, &sw) catch unreachable;
+        return .{ .raw = sw.written() };
+    }
+
+    pub fn Iterator(comptime known_fields: []const u29) type {
+        return struct {
+            source: UnknownFields,
+            chunk_idx: usize = 0,
+            reader: Reader = Reader.init(""),
+            filter_known: bool = false,
+            active: bool = false,
+
+            fn loadChunk(self: *@This()) bool {
+                switch (self.source) {
+                    .empty => return false,
+                    .raw => |b| {
+                        if (self.chunk_idx > 0 or b.len == 0) return false;
+                        self.chunk_idx = 1;
+                        self.reader = Reader.init(b);
+                        self.filter_known = false;
+                        self.active = true;
+                        return true;
+                    },
+                    .window => |win| {
+                        if (self.chunk_idx > 0 or win.len == 0) return false;
+                        self.chunk_idx = 1;
+                        self.reader = Reader.init(win);
+                        self.filter_known = true;
+                        self.active = true;
+                        return true;
+                    },
+                    .chunks => |c| {
+                        if (self.chunk_idx >= c.len) return false;
+                        const idx = self.chunk_idx;
+                        self.chunk_idx += 1;
+                        self.reader = Reader.init(c.sliceAt(idx));
+                        self.filter_known = c.isWindowChunk(idx);
+                        self.active = true;
+                        return true;
+                    },
+                }
+            }
+
+            pub fn next(self: *@This()) DecodeError!?UnknownField {
+                @setEvalBranchQuota(100_000);
+                while (true) {
+                    if (!self.active or self.reader.eof()) {
+                        if (!self.loadChunk()) return null;
+                    }
+                    const raw_tag = (try self.reader.readRawTag()) orelse continue;
+                    const tag = try decodeTag(raw_tag);
+                    if (self.filter_known and isKnownField(known_fields, tag.field_number)) {
+                        try self.reader.skipField(tag, max_recursion_depth);
+                        continue;
+                    }
+                    return try self.reader.readUnknownField(tag, max_recursion_depth);
+                }
+            }
+        };
+    }
+
+    pub inline fn iterator(self: UnknownFields, comptime known_fields: []const u29) Iterator(known_fields) {
+        return .{ .source = self };
+    }
+
+    pub fn formatWithKnown(
+        self: UnknownFields,
+        comptime known_fields: []const u29,
+        w: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
+        try w.writeByte('[');
+        var it = self.iterator(known_fields);
+        var first = true;
+        while (true) {
+            const maybe_u = it.next() catch {
+                if (!first) try w.writeAll(", ");
+                try w.writeAll("<invalid>");
+                break;
+            };
+            const u = maybe_u orelse break;
+            if (!first) try w.writeAll(", ");
+            try w.print("#{d}({s}, {d}B)", .{ u.field_number, @tagName(u.wire_type), u.bytes.len });
+            first = false;
+        }
+        try w.writeByte(']');
+    }
+};
+
+fn selectorFieldName(comptime item: anytype) []const u8 {
+    return switch (@typeInfo(@TypeOf(item))) {
+        .enum_literal => @tagName(item),
+        .pointer => item,
+        else => @compileError("decodeOnly selectors must be enum literals like `.id`"),
+    };
+}
+
+/// Builds a minimal struct containing only the selected fields of message `M`,
+/// preserving each field's exact type, alignment, and Protobuf default value.
+pub fn Projection(comptime M: type, comptime fields: anytype) type {
+    @setEvalBranchQuota(100_000);
+    const m_info = @typeInfo(M).@"struct";
+    const sel_info = @typeInfo(@TypeOf(fields)).@"struct";
+    const n = sel_info.field_names.len;
+
+    var names: [n][]const u8 = undefined;
+    var types: [n]type = undefined;
+    var attrs: [n]std.lang.Type.Struct.FieldAttributes = undefined;
+
+    inline for (sel_info.field_names, 0..) |tuple_key, i| {
+        const want = selectorFieldName(@field(fields, tuple_key));
+        for (0..i) |prev| {
+            if (std.mem.eql(u8, names[prev], want)) {
+                @compileError("duplicate field in decodeOnly: " ++ want);
+            }
+        }
+        var found = false;
+        inline for (m_info.field_names, m_info.field_types, m_info.field_attrs) |fname, ftype, fattr| {
+            if (std.mem.eql(u8, fname, want)) {
+                names[i] = fname;
+                types[i] = ftype;
+                attrs[i] = fattr;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            @compileError("unknown field '" ++ want ++ "' for " ++ @typeName(M));
+        }
+    }
+
+    return @Struct(.auto, null, &names, &types, &attrs);
+}
+
+// --- Owned Escape Hatch (Arena-Backed Deep Copy) ---
+
+/// Self-contained arena-backed deep copy of a message that can outlive its wire buffer.
+/// All wire-backed views (`Repeated`, `Map`, `Lazy`, strings/bytes) are materialized into
+/// owned memory; calling `.deinit()` releases the entire graph in O(1).
+pub fn Owned(comptime M: type) type {
+    return struct {
+        arena: std.heap.ArenaAllocator,
+        value: M,
+
+        pub fn deinit(self: *@This()) void {
+            self.arena.deinit();
+        }
+    };
+}
+
+/// Deep-copies `msg` into a caller-managed arena (ideal for per-request HTTP/gRPC arenas).
+pub fn cloneMessage(arena: Allocator, msg: anytype) CloneError!@TypeOf(msg) {
+    return cloneValue(arena, msg, max_recursion_depth);
+}
+
+/// Creates a dedicated `ArenaAllocator`, deep-copies `msg` into it, and returns an `Owned(M)`.
+pub fn cloneOwned(allocator: Allocator, msg: anytype) CloneError!Owned(@TypeOf(msg)) {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const cloned = try cloneValue(arena.allocator(), msg, max_recursion_depth);
+    return .{
+        .arena = arena,
+        .value = cloned,
+    };
+}
+
+fn cloneValue(allocator: Allocator, val: anytype, depth: u32) CloneError!@TypeOf(val) {
+    @setEvalBranchQuota(100_000);
+    const T = @TypeOf(val);
+
+    if (@typeInfo(T) == .@"union" and @hasDecl(T, "_protoz_kind")) {
+        switch (T._protoz_kind) {
+            .lazy => {
+                if (depth == 0) return error.RecursionLimitExceeded;
+                const M = @typeInfo(@FieldType(T, "ptr")).pointer.child;
+                const sub = try val.decodeDepth(depth);
+                const ptr = try allocator.create(M);
+                ptr.* = try cloneValue(allocator, sub, depth - 1);
+                return .{ .ptr = ptr };
+            },
+            .repeated => {
+                const Elem = @typeInfo(@FieldType(T, "slice")).pointer.child;
+                var list: std.ArrayList(Elem) = .empty;
+                var it = val.iterator();
+                while (try it.next()) |item| {
+                    try list.append(allocator, try cloneValue(allocator, item, depth));
+                }
+                return .{ .slice = try list.toOwnedSlice(allocator) };
+            },
+            .map => {
+                const Entry = @typeInfo(@FieldType(T, "slice")).pointer.child;
+                var list: std.ArrayList(Entry) = .empty;
+                var it = val.iterator();
+                while (try it.next()) |entry| {
+                    try list.append(allocator, .{
+                        .key = try cloneValue(allocator, entry.key, depth),
+                        .value = try cloneValue(allocator, entry.value, depth),
+                    });
+                }
+                return .{ .slice = try list.toOwnedSlice(allocator) };
+            },
+            .unknown_fields => return try val.cloneCompact(allocator, &.{}),
+        }
+    } else switch (@typeInfo(T)) {
+        .optional => {
+            if (val) |inner| {
+                return try cloneValue(allocator, inner, depth);
+            }
+            return null;
+        },
+        .pointer => |p| {
+            if (p.size == .slice and p.child == u8) {
+                if (val.len == 0) return "";
+                return try allocator.dupe(u8, val);
+            }
+            @compileError("unsupported pointer type in wire.cloneMessage: " ++ @typeName(T));
+        },
+        .@"union" => {
+            switch (val) {
+                inline else => |payload, tag| {
+                    return @unionInit(T, @tagName(tag), try cloneValue(allocator, payload, depth));
+                },
+            }
+        },
+        .@"struct" => |st| {
+            var out: T = undefined;
+            inline for (st.field_names, st.field_types) |fname, FT| {
+                if (FT == UnknownFields and @hasDecl(T, "_protoz_known_fields")) {
+                    @field(out, fname) = try @field(val, fname).cloneCompact(allocator, T._protoz_known_fields);
+                } else {
+                    @field(out, fname) = try cloneValue(allocator, @field(val, fname), depth);
+                }
+            }
+            return out;
+        },
+        .bool, .int, .float, .@"enum", .void => return val,
+        else => @compileError("unsupported type in wire.cloneMessage: " ++ @typeName(T)),
+    }
+}
+
+/// Codec for Proto2 delimited `group` fields (`TAG(N, .sgroup) ... TAG(N, .egroup)`).
+/// Compatible with `wire.Repeated(wire.GroupCodec(GroupMsg, N))`.
+pub fn GroupCodec(comptime M: type, comptime field_number: u29) type {
+    @setEvalBranchQuota(100_000);
+    return struct {
+        pub const T = M;
+        pub const wire_type: WireType = .sgroup;
+        pub const is_packable: bool = false;
+        pub const is_message: bool = true;
+        pub const fixed_size: ?usize = null;
+        pub const default_value: T = .{};
+
+        pub inline fn isDefault(_: T) bool {
+            return false;
+        }
+
+        pub fn size(v: T) usize {
+            return v.encodedSize() + tagSize(field_number);
+        }
+
+        pub fn write(w: anytype, v: T) WriterError(@TypeOf(w))!void {
+            try v.encode(w);
+            try writeTag(w, field_number, .egroup);
+        }
+
+        pub fn writeReverse(rw: *ReverseWriter, v: T) EncodeError!void {
+            try rw.writeTag(field_number, .egroup);
+            try v.encodeReverse(rw);
+        }
+
+        pub fn read(r: *Reader, depth: u32) DecodeError!T {
+            const body = try r.readGroupBytes(field_number, depth);
+            return M.decodeDepth(body, depth);
+        }
+
+        pub fn mergeRead(dst: *T, r: *Reader, depth: u32) DecodeError!void {
+            const body = try r.readGroupBytes(field_number, depth);
+            try dst.mergeDepth(body, depth);
+        }
+
+        pub fn validate(r: *Reader, depth: u32) DecodeError!void {
+            const body = try r.readGroupBytes(field_number, depth);
+            try M.validateDepth(body, depth);
+        }
+    };
+}
+
+fn unknownFieldsOf(msg: anytype) *const UnknownFields {
+    const M = @typeInfo(@TypeOf(msg)).pointer.child;
+    if (comptime @hasField(M, "_unknown_fields")) return &msg._unknown_fields;
+    if (comptime @hasField(M, "_protoz_unknown_fields")) return &msg._protoz_unknown_fields;
+    @compileError(@typeName(M) ++ " was compiled without `preserve_unknown_fields = true`");
+}
+
+fn decodeUnknownPayload(comptime Codec: type, u: UnknownField) DecodeError!Codec.T {
+    if (comptime Codec.is_message) {
+        if (comptime Codec.wire_type == .sgroup) {
+            var er = Reader.init(u.bytes);
+            const body = try er.readGroupBytes(u.field_number, max_recursion_depth);
+            return Codec.T.decodeDepth(body, max_recursion_depth);
+        }
+        return Codec.T.decodeDepth(u.bytes, max_recursion_depth);
+    } else if (comptime Codec.wire_type == .len) {
+        if (comptime Codec == ScalarCodec(.string_utf8)) {
+            if (!std.unicode.utf8ValidateSlice(u.bytes)) return error.InvalidUtf8;
+        }
+        return u.bytes;
+    } else {
+        var er = Reader.init(u.bytes);
+        return Codec.read(&er, max_recursion_depth);
+    }
+}
+
+/// Zero-allocation typed Proto2 singular extension descriptor backed by `UnknownFields`.
+pub fn Extension(comptime Extendee: type, comptime field_number: u29, comptime Codec: type) type {
+    return struct {
+        pub const Host = Extendee;
+        pub const number: u29 = field_number;
+        pub const Value = Codec.T;
+
+        pub fn has(msg: *const Extendee) DecodeError!bool {
+            const uf = unknownFieldsOf(msg);
+            var it = uf.iterator(Extendee._protoz_known_fields);
+            while (try it.next()) |u| {
+                if (u.field_number == field_number) return true;
+            }
+            return false;
+        }
+
+        pub fn get(msg: *const Extendee) DecodeError!?Value {
+            const uf = unknownFieldsOf(msg);
+            var it = uf.iterator(Extendee._protoz_known_fields);
+            var found: ?Value = null;
+            while (try it.next()) |u| {
+                if (u.field_number != field_number) continue;
+                if (u.wire_type != Codec.wire_type) return error.WireTypeMismatch;
+                if (comptime Codec.is_message) {
+                    const body = if (comptime Codec.wire_type == .sgroup) blk: {
+                        var er = Reader.init(u.bytes);
+                        break :blk try er.readGroupBytes(field_number, max_recursion_depth);
+                    } else u.bytes;
+                    if (found) |*existing| {
+                        try existing.mergeDepth(body, max_recursion_depth);
+                    } else {
+                        found = try Codec.T.decodeDepth(body, max_recursion_depth);
+                    }
+                } else {
+                    found = try decodeUnknownPayload(Codec, u);
+                }
+            }
+            return found;
+        }
+
+        pub fn encodeSlice(val: Value, buf: []u8) EncodeError![]const u8 {
+            var rw = ReverseWriter.init(buf);
+            try Codec.writeReverse(&rw, val);
+            try rw.writeTag(field_number, Codec.wire_type);
+            return rw.written();
+        }
+    };
+}
+
+/// Zero-allocation typed Proto2 repeated extension descriptor backed by `UnknownFields`.
+pub fn RepeatedExtension(comptime Extendee: type, comptime field_number: u29, comptime Codec: type) type {
+    return struct {
+        pub const Host = Extendee;
+        pub const number: u29 = field_number;
+        pub const Value = Codec.T;
+
+        pub const Iterator = struct {
+            base: UnknownFields.Iterator(Extendee._protoz_known_fields),
+            packed_reader: ?Reader = null,
+
+            pub fn next(self: *@This()) DecodeError!?Value {
+                while (true) {
+                    if (self.packed_reader) |*pr| {
+                        if (!pr.eof()) return try Codec.read(pr, max_recursion_depth);
+                        self.packed_reader = null;
+                    }
+                    const u = (try self.base.next()) orelse return null;
+                    if (u.field_number != field_number) continue;
+                    if (u.wire_type == Codec.wire_type) {
+                        return try decodeUnknownPayload(Codec, u);
+                    }
+                    if (comptime Codec.is_packable) {
+                        if (u.wire_type == .len) {
+                            self.packed_reader = Reader.init(u.bytes);
+                            continue;
+                        }
+                    }
+                    return error.WireTypeMismatch;
+                }
+            }
+        };
+
+        pub inline fn iterator(msg: *const Extendee) Iterator {
+            return .{ .base = unknownFieldsOf(msg).iterator(Extendee._protoz_known_fields) };
+        }
+
+        pub fn encodeSlice(items: []const Value, comptime pack: bool, buf: []u8) EncodeError![]const u8 {
+            const rep: Repeated(Codec) = .{ .slice = items };
+            var rw = ReverseWriter.init(buf);
+            try rep.encodeReverse(field_number, pack, &rw);
+            return rw.written();
         }
     };
 }

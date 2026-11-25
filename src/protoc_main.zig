@@ -2,6 +2,7 @@ const std = @import("std");
 const loader = @import("loader.zig");
 const resolver = @import("resolver.zig");
 const codegen = @import("codegen.zig");
+const diag_mod = @import("diag.zig");
 
 fn parentDir(path: []const u8) ?[]const u8 {
     if (std.mem.lastIndexOfScalar(u8, path, '/')) |idx| {
@@ -70,6 +71,7 @@ pub fn main(init: std.process.Init) !void {
     var out_dir: ?[]const u8 = null;
     var root_file_name: ?[]const u8 = null;
     var depfile_path: ?[]const u8 = null;
+    var preserve_unknown_fields = false;
 
     var args = try init.minimal.args.iterateAllocator(arena);
     _ = args.next(); // argv[0]
@@ -82,6 +84,8 @@ pub fn main(init: std.process.Init) !void {
             root_file_name = args.next() orelse return error.MissingRootFileName;
         } else if (std.mem.eql(u8, arg, "--depfile")) {
             depfile_path = args.next() orelse return error.MissingDepfilePath;
+        } else if (std.mem.eql(u8, arg, "--preserve-unknown-fields")) {
+            preserve_unknown_fields = true;
         } else if (std.mem.eql(u8, arg, "-I") or std.mem.eql(u8, arg, "--proto-path")) {
             try include_dirs.append(arena, args.next() orelse return error.MissingIncludeDir);
         } else if (std.mem.startsWith(u8, arg, "-I")) {
@@ -93,8 +97,19 @@ pub fn main(init: std.process.Init) !void {
 
     if (entry_files.items.len == 0) return error.MissingInputPath;
 
-    const ws = try loader.Loader.load(arena, init.io, include_dirs.items, entry_files.items);
-    const res = try resolver.Resolver.buildMulti(arena, ws.files);
+    var diag: diag_mod.Diagnostic = .{};
+    const ws = loader.Loader.loadWithDiag(arena, init.io, include_dirs.items, entry_files.items, &diag) catch |err| {
+        var err_buf: [1024]u8 = undefined;
+        var stderr_w = std.Io.File.stderr().writerStreaming(init.io, &err_buf);
+        if (diag.message.len > 0) {
+            try diag.format(&stderr_w.interface);
+        } else {
+            try stderr_w.interface.print("zig-protoc: error: {s}\n", .{@errorName(err)});
+        }
+        try stderr_w.interface.flush();
+        std.process.exit(1);
+    };
+    const res = try resolver.Resolver.buildMultiWithDiag(arena, ws.files, &diag);
     const cwd = std.Io.Dir.cwd();
 
     if (out_dir) |raw_dir_path| {
@@ -110,7 +125,9 @@ pub fn main(init: std.process.Init) !void {
             const out_file = try cwd.createFile(init.io, full_out, .{});
             defer out_file.close(init.io);
             var writer = out_file.writerStreaming(init.io, &buf);
-            try codegen.generateFile(arena, idx, &res, &writer.interface);
+            try codegen.generateFileWithOptions(arena, idx, &res, &writer.interface, .{
+                .preserve_unknown_fields = preserve_unknown_fields,
+            });
             try writer.interface.flush();
         }
 
@@ -158,11 +175,15 @@ pub fn main(init: std.process.Init) !void {
         const out_file = try cwd.createFile(init.io, clean_out, .{});
         defer out_file.close(init.io);
         var writer = out_file.writerStreaming(init.io, &buf);
-        try codegen.generateFile(arena, target_idx, &res, &writer.interface);
+        try codegen.generateFileWithOptions(arena, target_idx, &res, &writer.interface, .{
+            .preserve_unknown_fields = preserve_unknown_fields,
+        });
         try writer.interface.flush();
     } else {
         var writer = std.Io.File.stdout().writerStreaming(init.io, &buf);
-        try codegen.generateFile(arena, target_idx, &res, &writer.interface);
+        try codegen.generateFileWithOptions(arena, target_idx, &res, &writer.interface, .{
+            .preserve_unknown_fields = preserve_unknown_fields,
+        });
         try writer.interface.flush();
     }
 }

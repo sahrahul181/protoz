@@ -1,0 +1,53 @@
+syntax = "proto3";
+package stress.base;
+
+enum StatusFlag {
+  option allow_alias = true;
+  STATUS_UNSPECIFIED = 0;
+  STATUS_OK = 1;
+  STATUS_HEALTHY = 1;
+  STATUS_ERR = -1;
+  STATUS_MIN = -2147483648;
+  STATUS_MAX = 2147483647;
+}
+
+enum KeywordEnum {
+  KEYWORD_ZERO = 0;
+  type = 1;
+  error = 2;
+  fn = 3;
+  align = 4;
+  test = 5;
+}
+
+message EmptyMarker {}
+
+// Zig keyword + primitive named message with Zig keyword/primitive fields
+message type {
+  string error = 1;
+  bytes fn = 2;
+  int32 align = 3;
+  bool test = 4;
+  KeywordEnum struct = 5;
+  uint32 u32 = 6;
+  bool void = 7;
+}
+
+// Self-recursive across singular, repeated, map, and oneof
+message TreeNode {
+  string label = 1;
+  TreeNode parent = 2;
+  repeated TreeNode children = 3;
+  map<string, TreeNode> named_children = 4;
+  oneof branch {
+    TreeNode alt_node = 5;
+    int64 leaf_val = 6;
+  }
+}
+
+service BaseService {
+  rpc Ping (EmptyMarker) returns (EmptyMarker);
+  rpc Upload (stream TreeNode) returns (EmptyMarker);
+  rpc StreamTree (TreeNode) returns (stream TreeNode);
+  rpc Sync (stream TreeNode) returns (stream TreeNode);
+}

@@ -63,39 +63,72 @@ test "malformed: truncated length-delimited payload and invalid UTF-8" {
     try std.testing.expectError(error.InvalidUtf8, pb.SmallEvent.validateDepth(&bad_utf8, wire.max_recursion_depth));
 }
 
-test "malformed: recursion depth bomb (>100 nested submessages / groups)" {
-    // Build a 105-deep nested SGROUP/EGROUP unknown field wrapper for field 99:
-    // outer validateDepth runs at depth = 100, and skipping nested SGROUP decrements depth.
-    var bomb: [220]u8 = undefined;
+test "malformed: recursion depth bomb (>100 nested groups and cyclic submessages)" {
+    // 1. 105-deep nested SGROUP/EGROUP unknown field wrapper (field 15)
+    var group_bomb: [220]u8 = undefined;
     var pos: usize = 0;
     for (0..105) |_| {
-        // tag 15 (field 15, wire_type = 3 sgroup) -> 1 byte = (15 << 3) | 3 = 0x7B
-        bomb[pos] = 0x7B;
+        group_bomb[pos] = (15 << 3) | 3; // sgroup
         pos += 1;
     }
     for (0..105) |_| {
-        // tag 15 (field 15, wire_type = 4 egroup) -> 1 byte = (15 << 3) | 4 = 0x7C
-        bomb[pos] = 0x7C;
+        group_bomb[pos] = (15 << 3) | 4; // egroup
         pos += 1;
     }
-    try std.testing.expectError(error.RecursionLimitExceeded, pb.SmallEvent.decode(bomb[0..pos]));
-    try std.testing.expectError(error.RecursionLimitExceeded, pb.SmallEvent.validateDepth(bomb[0..pos], wire.max_recursion_depth));
+    try std.testing.expectError(error.RecursionLimitExceeded, pb.SmallEvent.decode(group_bomb[0..pos]));
+    try std.testing.expectError(error.RecursionLimitExceeded, pb.SmallEvent.validateDepth(group_bomb[0..pos], wire.max_recursion_depth));
+
+    // 2. 105-deep nested length-delimited cyclic `UserProfile.manager` (field 11)
+    var msg_bomb: [512]u8 = undefined;
+    var cur_slice: []const u8 = &.{};
+    for (0..105) |_| {
+        var next_buf: [512]u8 = undefined;
+        var sw = wire.SliceWriter.init(&next_buf);
+        try wire.writeTag(&sw, 11, .len);
+        try wire.writeBytes(&sw, cur_slice);
+        const written = sw.written();
+        @memcpy(msg_bomb[0..written.len], written);
+        cur_slice = msg_bomb[0..written.len];
+    }
+    try std.testing.expectError(error.RecursionLimitExceeded, pb.UserProfile.decode(cur_slice));
+    try std.testing.expectError(error.RecursionLimitExceeded, pb.UserProfile.validateDepth(cur_slice, wire.max_recursion_depth));
 }
 
 test "malformed: merge chunk limit exceeded and BufferTooSmall" {
-    // > max_merge_chunks occurrences of Lazy submessage field 11 (`manager`) overflows WireChunks.
-    var fragmented: [128]u8 = undefined;
+    // 1. Same-buffer Lazy occurrences extend `.wire` cleanly for arbitrary counts
+    var same_buf: [128]u8 = undefined;
     var pos: usize = 0;
-    for (0..wire.max_merge_chunks + 2) |_| {
-        fragmented[pos] = (11 << 3) | 2; // field 11 (`manager`), LEN
-        fragmented[pos + 1] = 0x02;
-        fragmented[pos + 2] = 0x08; // inner field 1 (id)
-        fragmented[pos + 3] = 0x01;
+    for (0..wire.max_merge_chunks + 4) |_| {
+        same_buf[pos] = (11 << 3) | 2; // field 11 (`manager`), LEN
+        same_buf[pos + 1] = 0x02;
+        same_buf[pos + 2] = 0x08; // inner field 1 (id)
+        same_buf[pos + 3] = 0x01;
         pos += 4;
     }
-    try std.testing.expectError(error.MergeChunkLimitExceeded, pb.UserProfile.decode(fragmented[0..pos]));
+    const same_dec = try pb.UserProfile.decode(same_buf[0..pos]);
+    const same_mgr = try same_dec.manager.?.decode();
+    try std.testing.expectEqual(@as(u64, 1), same_mgr.id);
 
-    // Encoding into undersized buffer returns BufferTooSmall cleanly
+    // 2. Disjoint-buffer mergeDepth on Lazy (`RawPair` supports 2 chunks, 3rd fails)
+    const mgr_chunk = [_]u8{ (11 << 3) | 2, 0x02, 0x08, 0x01 };
+    var lazy_bufs: [3][4]u8 = .{ mgr_chunk, mgr_chunk, mgr_chunk };
+    var lazy_msg: pb.UserProfile = .{};
+    try lazy_msg.mergeDepth(&lazy_bufs[0], wire.max_recursion_depth);
+    try lazy_msg.mergeDepth(&lazy_bufs[1], wire.max_recursion_depth);
+    try std.testing.expectError(error.MergeChunkLimitExceeded, lazy_msg.mergeDepth(&lazy_bufs[2], wire.max_recursion_depth));
+
+    // 3. Disjoint-buffer mergeDepth on Repeated (`WireChunks` supports `max_merge_chunks`)
+    const score_chunk = [_]u8{ 0x20, 0x07 }; // field 4 (`scores`), varint 7
+    var rep_bufs: [wire.max_merge_chunks + 1][2]u8 = undefined;
+    var rep_msg: pb.UserProfile = .{};
+    for (0..wire.max_merge_chunks) |i| {
+        rep_bufs[i] = score_chunk;
+        try rep_msg.mergeDepth(&rep_bufs[i], wire.max_recursion_depth);
+    }
+    rep_bufs[wire.max_merge_chunks] = score_chunk;
+    try std.testing.expectError(error.MergeChunkLimitExceeded, rep_msg.mergeDepth(&rep_bufs[wire.max_merge_chunks], wire.max_recursion_depth));
+
+    // 4. Encoding into undersized buffer returns BufferTooSmall cleanly
     const ev = pb.SmallEvent{ .id = 42, .source = "hello-world" };
     var tiny: [4]u8 = undefined;
     try std.testing.expectError(error.BufferTooSmall, ev.encodeSlice(&tiny));
@@ -135,7 +168,7 @@ fn traverseBatch(d: pb.TelemetryBatch) wire.DecodeError!u64 {
     var hit = d.hashes.iterator();
     while (try hit.next()) |h| acc +%= h;
     var pit = d.points.iterator();
-    while (try pit.next()) |pt| acc +%= pt.ts +% pt.label.len;
+    while (try pit.next()) |pt| acc +%= pt.ts +% pt.label.len +% @as(u64, @bitCast(pt.value));
     return acc;
 }
 
@@ -168,8 +201,10 @@ fn traverseStruct(s: wkt.google_protobuf_struct.Struct, depth: u32) wire.DecodeE
 
 /// Checks arbitrary wire bytes against Message `M`:
 /// 1) Never panics in validateDepth, decode, or traversal.
-/// 2) If decode + full traversal succeeds, re-encoding with both encodeSlice & encode
-///    must match `decoded.encodedSize()` byte-for-byte and re-decode cleanly.
+/// 2) `validateDepth` and `decode` must agree on validity (decode may only additionally
+///    return `MergeChunkLimitExceeded` on disjoint multi-chunk merges).
+/// 3) If decode succeeds, re-encoding via both `encodeSlice` and `encode` must match
+///    `decoded.encodedSize()` byte-for-byte and re-decode cleanly.
 fn checkArbitraryWire(
     comptime M: type,
     bytes: []const u8,
@@ -181,44 +216,34 @@ fn checkArbitraryWire(
     const dec_res = M.decode(bytes);
 
     if (val_res) |_| {
-        // Validation passed; decode may only additionally fail with MergeChunkLimitExceeded.
-        if (dec_res) |d| {
-            if (traverse_fn) |tf| {
-                if (tf(d)) |acc| {
-                    std.mem.doNotOptimizeAway(acc);
-                } else |_| {
-                    return;
-                }
-            }
-            const expected_len = d.encodedSize();
-            if (expected_len <= scratch_a.len) {
-                const slice_out = try d.encodeSlice(scratch_a);
-                try std.testing.expectEqual(expected_len, slice_out.len);
+        const d = dec_res catch |err| switch (err) {
+            error.MergeChunkLimitExceeded => return,
+            else => return err,
+        };
 
-                var sw = wire.SliceWriter.init(scratch_b);
-                try d.encode(&sw);
-                try std.testing.expectEqualSlices(u8, slice_out, sw.written());
+        if (traverse_fn) |tf| {
+            const acc = tf(d) catch |err| switch (err) {
+                error.MergeChunkLimitExceeded => return,
+                else => return err,
+            };
+            std.mem.doNotOptimizeAway(acc);
+        }
 
-                try M.validateDepth(slice_out, wire.max_recursion_depth);
-                _ = try M.decode(slice_out);
-            }
-        } else |err| switch (err) {
-            error.MergeChunkLimitExceeded => {},
-            else => {
-                // Note: Lazy / Map / Repeated entries aren't validated eagerly for internal
-                // payload corruption on decode() unless traversed; allow other DecodeErrors only if valid?
-                // Wait: validateDepth ALREADY validates nested/map/repeated entries eagerly, so
-                // decode() must not fail with anything other than MergeChunkLimitExceeded!
-                return err;
-            },
+        const expected_len = d.encodedSize();
+        if (expected_len <= scratch_a.len) {
+            const slice_out = try d.encodeSlice(scratch_a);
+            try std.testing.expectEqual(expected_len, slice_out.len);
+
+            var sw = wire.SliceWriter.init(scratch_b);
+            try d.encode(&sw);
+            try std.testing.expectEqualSlices(u8, slice_out, sw.written());
+
+            try M.validateDepth(slice_out, wire.max_recursion_depth);
+            _ = try M.decode(slice_out);
         }
     } else |_| {
-        // validateDepth rejected the payload. If decode() didn't catch a lazy inner field yet,
-        // full traversal MUST reject it (unless it was an untouched lazy depth-100 boundary).
-        if (dec_res) |d| {
-            if (traverse_fn) |tf| {
-                _ = tf(d) catch {};
-            }
+        if (dec_res) |_| {
+            return error.DecodeAcceptedInvalidWire;
         } else |_| {}
     }
 }
@@ -229,11 +254,22 @@ fn checkAllSchemas(bytes: []const u8, scratch_a: []u8, scratch_b: []u8) !void {
     try checkArbitraryWire(pb.TelemetryBatch, bytes, traverseBatch, scratch_a, scratch_b);
     try checkArbitraryWire(wkt.google_protobuf_timestamp.Timestamp, bytes, null, scratch_a, scratch_b);
 
-    // Also exercise Struct decode + validateDepth + traversal without panicking
-    _ = wkt.google_protobuf_struct.Struct.validateDepth(bytes, wire.max_recursion_depth) catch {};
-    if (wkt.google_protobuf_struct.Struct.decode(bytes)) |st| {
-        _ = traverseStruct(st, 16) catch {};
-    } else |_| {}
+    // Exercise recursive Struct validateDepth/decode parity + traversal
+    const st_val = wkt.google_protobuf_struct.Struct.validateDepth(bytes, wire.max_recursion_depth);
+    const st_dec = wkt.google_protobuf_struct.Struct.decode(bytes);
+    if (st_val) |_| {
+        const st = st_dec catch |err| switch (err) {
+            error.MergeChunkLimitExceeded => return,
+            else => return err,
+        };
+        const acc = traverseStruct(st, 16) catch |err| switch (err) {
+            error.MergeChunkLimitExceeded => return,
+            else => return err,
+        };
+        std.mem.doNotOptimizeAway(acc);
+    } else |_| {
+        if (st_dec) |_| return error.DecodeAcceptedInvalidWire else |_| {}
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -241,7 +277,7 @@ fn checkAllSchemas(bytes: []const u8, scratch_a: []u8, scratch_b: []u8) !void {
 // ---------------------------------------------------------------------------
 
 const SeedCorpus = struct {
-    small: [32]u8,
+    small: [64]u8,
     small_len: usize,
     user: [512]u8,
     user_len: usize,
@@ -257,10 +293,9 @@ const SeedCorpus = struct {
             .status = 200,
             .source = "edge-gw-01",
         };
-        c.small_len = (try ev.encodeSlice(&c.small)).len;
-        // Shift slice to start at index 0
-        const s_off = c.small.len - c.small_len;
-        std.mem.copyForwards(u8, c.small[0..c.small_len], c.small[s_off..]);
+        const s_enc = try ev.encodeSlice(&c.small);
+        c.small_len = s_enc.len;
+        std.mem.copyForwards(u8, c.small[0..c.small_len], s_enc);
 
         const mgr = pb.UserProfile{
             .id = 1,
@@ -307,17 +342,14 @@ const SeedCorpus = struct {
 };
 
 fn randomUtf8(rng: std.Random, buf: []u8) []const u8 {
-    const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789-_./@🚀测试";
+    const ascii = "abcdefghijklmnopqrstuvwxyz0123456789-_./@";
     const max_len = @min(buf.len, 24);
     const target_len = rng.uintLessThan(usize, max_len + 1);
     var pos: usize = 0;
     while (pos < target_len) {
-        // Pick a valid UTF-8 codepoint sequence cleanly
-        const choice = rng.uintLessThan(usize, 5);
-        switch (choice) {
+        switch (rng.uintLessThan(u8, 5)) {
             0 => {
-                // ASCII
-                buf[pos] = alphabet[rng.uintLessThan(usize, 40)];
+                buf[pos] = ascii[rng.uintLessThan(usize, ascii.len)];
                 pos += 1;
             },
             1 => {
@@ -365,12 +397,38 @@ fn edgeI64(rng: std.Random) i64 {
 }
 
 fn edgeU64(rng: std.Random) u64 {
-    return switch (rng.uintLessThan(u8, 5)) {
+    return switch (rng.uintLessThan(u8, 6)) {
         0 => 0,
         1 => 1,
         2 => 127,
         3 => 128,
+        4 => std.math.maxInt(u64),
         else => rng.int(u64),
+    };
+}
+
+fn edgeF64(rng: std.Random) f64 {
+    return switch (rng.uintLessThan(u8, 7)) {
+        0 => 0.0,
+        1 => -0.0,
+        2 => 1.0,
+        3 => -42.125,
+        4 => std.math.inf(f64),
+        5 => -std.math.inf(f64),
+        else => @bitCast(rng.int(u64)),
+    };
+}
+
+fn edgeRole(rng: std.Random) pb.Role {
+    return switch (rng.uintLessThan(u8, 8)) {
+        0 => .ROLE_UNSPECIFIED,
+        1 => .ROLE_ADMIN,
+        2 => .ROLE_MEMBER,
+        3 => @fromBackingInt(-1), // 10-byte sign-extended negative enum varint
+        4 => @fromBackingInt(-42),
+        5 => @fromBackingInt(999),
+        6 => @fromBackingInt(std.math.minInt(i32)),
+        else => @fromBackingInt(std.math.maxInt(i32)),
     };
 }
 
@@ -388,11 +446,9 @@ pub fn runMutationFuzz(iters: usize, seed: u64) !void {
         var len: usize = 0;
 
         if (mode == 4) {
-            // Pure random bytes
             len = rng.uintLessThan(usize, 256);
             rng.bytes(mut_buf[0..len]);
         } else {
-            // Pick one of the 3 valid seed messages and mutate it
             const src = switch (iter % 3) {
                 0 => corpus.small[0..corpus.small_len],
                 1 => corpus.user[0..corpus.user_len],
@@ -404,7 +460,6 @@ pub fn runMutationFuzz(iters: usize, seed: u64) !void {
             if (len > 0) {
                 switch (mode) {
                     0 => {
-                        // Bit flips (1..4 flips)
                         const flips = rng.uintLessThan(usize, 4) + 1;
                         for (0..flips) |_| {
                             const idx = rng.uintLessThan(usize, len);
@@ -413,17 +468,14 @@ pub fn runMutationFuzz(iters: usize, seed: u64) !void {
                         }
                     },
                     1 => {
-                        // Truncate
                         len = rng.uintLessThan(usize, len + 1);
                     },
                     2 => {
-                        // Byte overwrite burst
                         const idx = rng.uintLessThan(usize, len);
                         const burst = @min(len - idx, rng.uintLessThan(usize, 8) + 1);
                         rng.bytes(mut_buf[idx .. idx + burst]);
                     },
                     else => {
-                        // Duplicate / append random tail
                         const extra = rng.uintLessThan(usize, 64);
                         if (len + extra <= mut_buf.len) {
                             rng.bytes(mut_buf[len .. len + extra]);
@@ -444,7 +496,7 @@ pub fn runStructuredFuzz(iters: usize, seed: u64) !void {
 
     var enc_rev: [8192]u8 = undefined;
     var enc_fwd: [8192]u8 = undefined;
-    var str_bufs: [8][32]u8 = undefined;
+    var str_bufs: [10][32]u8 = undefined;
 
     for (0..iters) |_| {
         // 1. SmallEvent roundtrip
@@ -471,7 +523,7 @@ pub fn runStructuredFuzz(iters: usize, seed: u64) !void {
             try std.testing.expectEqualStrings(msg.source, dec.source);
         }
 
-        // 2. UserProfile roundtrip (maps, repeated, nested, optional, oneof, Lazy)
+        // 2. UserProfile roundtrip (maps, repeated, nested, optional, oneof, negative enums, Lazy)
         {
             var scores_buf: [16]u32 = undefined;
             const n_scores = rng.uintLessThan(usize, scores_buf.len + 1);
@@ -491,19 +543,16 @@ pub fn runStructuredFuzz(iters: usize, seed: u64) !void {
             const mgr = pb.UserProfile{
                 .id = edgeU64(rng),
                 .name = randomUtf8(rng, &str_bufs[5]),
-                .role = @fromBackingInt(@intCast(@as(i32, @intCast(rng.uintLessThan(u8, 4))))),
+                .role = edgeRole(rng),
             };
-            const city = randomUtf8(rng, &str_bufs[6]);
-            const contact_str = randomUtf8(rng, &str_bufs[7]);
+            const user_name = randomUtf8(rng, &str_bufs[6]);
+            const city = randomUtf8(rng, &str_bufs[7]);
+            const contact_str = randomUtf8(rng, &str_bufs[8]);
 
             const msg = pb.UserProfile{
                 .id = edgeU64(rng),
-                .name = mgr.name,
-                .role = switch (rng.uintLessThan(u8, 3)) {
-                    0 => .ROLE_UNSPECIFIED,
-                    1 => .ROLE_ADMIN,
-                    else => .ROLE_MEMBER,
-                },
+                .name = user_name,
+                .role = edgeRole(rng),
                 .scores = .{ .slice = scores_buf[0..n_scores] },
                 .tags = .{ .slice = tags_buf[0..n_tags] },
                 .quotas = .{ .slice = quotas_buf[0..n_quotas] },
@@ -531,27 +580,112 @@ pub fn runStructuredFuzz(iters: usize, seed: u64) !void {
             try std.testing.expectEqual(msg.role, dec.role);
             try std.testing.expectEqual(msg.verified, dec.verified);
 
-            // Check repeated scores count & elements
-            var sit = dec.scores.iterator();
-            var idx: usize = 0;
-            while (try sit.next()) |s| : (idx += 1) {
-                try std.testing.expectEqual(scores_buf[idx], s);
+            if (msg.address) |addr| {
+                try std.testing.expect(dec.address != null);
+                try std.testing.expectEqualStrings(addr.city, dec.address.?.city);
+                try std.testing.expectEqual(addr.zip, dec.address.?.zip);
+            } else {
+                try std.testing.expect(dec.address == null);
             }
-            try std.testing.expectEqual(n_scores, idx);
 
-            // Check map last-key-wins semantics on "cpu"
+            if (msg.contact) |c| {
+                try std.testing.expect(dec.contact != null);
+                switch (c) {
+                    .email => |s| try std.testing.expectEqualStrings(s, dec.contact.?.email),
+                    .phone => |s| try std.testing.expectEqualStrings(s, dec.contact.?.phone),
+                }
+            } else {
+                try std.testing.expect(dec.contact == null);
+            }
+
+            var sit = dec.scores.iterator();
+            var s_idx: usize = 0;
+            while (try sit.next()) |s| : (s_idx += 1) {
+                try std.testing.expectEqual(scores_buf[s_idx], s);
+            }
+            try std.testing.expectEqual(n_scores, s_idx);
+
+            var tit = dec.tags.iterator();
+            var t_idx: usize = 0;
+            while (try tit.next()) |t| : (t_idx += 1) {
+                try std.testing.expectEqualStrings(tags_buf[t_idx], t);
+            }
+            try std.testing.expectEqual(n_tags, t_idx);
+
             if (n_quotas == 3) {
                 try std.testing.expectEqual(@as(?i32, quotas_buf[2].value), try dec.quotas.get("cpu"));
             } else if (n_quotas >= 1) {
                 try std.testing.expectEqual(@as(?i32, quotas_buf[0].value), try dec.quotas.get("cpu"));
             }
 
-            // Check cyclic Lazy submessage
             if (msg.manager != null) {
                 const dec_mgr = try dec.manager.?.decode();
                 try std.testing.expectEqual(mgr.id, dec_mgr.id);
                 try std.testing.expectEqualStrings(mgr.name, dec_mgr.name);
+                try std.testing.expectEqual(mgr.role, dec_mgr.role);
             }
+        }
+
+        // 3. TelemetryBatch roundtrip (packed ZigZag sint64, packed fixed64, f64 bit-exact, repeated submessages)
+        {
+            var deltas_buf: [24]i64 = undefined;
+            const n_deltas = rng.uintLessThan(usize, deltas_buf.len + 1);
+            for (deltas_buf[0..n_deltas]) |*d| d.* = edgeI64(rng);
+
+            var hashes_buf: [24]u64 = undefined;
+            const n_hashes = rng.uintLessThan(usize, hashes_buf.len + 1);
+            for (hashes_buf[0..n_hashes]) |*h| h.* = edgeU64(rng);
+
+            var points_buf: [8]pb.TelemetryBatch.Point = undefined;
+            const n_points = rng.uintLessThan(usize, points_buf.len + 1);
+            for (0..n_points) |i| {
+                points_buf[i] = .{
+                    .ts = edgeU64(rng),
+                    .value = edgeF64(rng),
+                    .label = randomUtf8(rng, &str_bufs[i]),
+                };
+            }
+
+            const batch = pb.TelemetryBatch{
+                .host = randomUtf8(rng, &str_bufs[9]),
+                .deltas = .{ .slice = deltas_buf[0..n_deltas] },
+                .hashes = .{ .slice = hashes_buf[0..n_hashes] },
+                .points = .{ .slice = points_buf[0..n_points] },
+            };
+
+            const rev = try batch.encodeSlice(&enc_rev);
+            try std.testing.expectEqual(batch.encodedSize(), rev.len);
+
+            var sw = wire.SliceWriter.init(&enc_fwd);
+            try batch.encode(&sw);
+            try std.testing.expectEqualSlices(u8, rev, sw.written());
+
+            try pb.TelemetryBatch.validateDepth(rev, wire.max_recursion_depth);
+            const dec = try pb.TelemetryBatch.decode(rev);
+            try std.testing.expectEqualStrings(batch.host, dec.host);
+
+            var dit = dec.deltas.iterator();
+            var d_idx: usize = 0;
+            while (try dit.next()) |v| : (d_idx += 1) {
+                try std.testing.expectEqual(deltas_buf[d_idx], v);
+            }
+            try std.testing.expectEqual(n_deltas, d_idx);
+
+            var hit = dec.hashes.iterator();
+            var h_idx: usize = 0;
+            while (try hit.next()) |h| : (h_idx += 1) {
+                try std.testing.expectEqual(hashes_buf[h_idx], h);
+            }
+            try std.testing.expectEqual(n_hashes, h_idx);
+
+            var pit = dec.points.iterator();
+            var p_idx: usize = 0;
+            while (try pit.next()) |pt| : (p_idx += 1) {
+                try std.testing.expectEqual(points_buf[p_idx].ts, pt.ts);
+                try std.testing.expectEqual(@as(u64, @bitCast(points_buf[p_idx].value)), @as(u64, @bitCast(pt.value)));
+                try std.testing.expectEqualStrings(points_buf[p_idx].label, pt.label);
+            }
+            try std.testing.expectEqual(n_points, p_idx);
         }
     }
 }
@@ -586,6 +720,38 @@ test "fuzz: std.testing.fuzz wire corpus and coverage hook" {
 // Standalone Runner (`zig build fuzz -- --iters 200000 --seed 123`)
 // Works natively on Windows, macOS, and Linux.
 // ---------------------------------------------------------------------------
+
+test "wkt: generated Timestamp, Duration, and Any delegate methods" {
+    const Ts = wkt.google_protobuf_timestamp.Timestamp;
+    const Dur = wkt.google_protobuf_duration.Duration;
+    const Any = wkt.google_protobuf_any.Any;
+
+    try std.testing.expectEqualStrings("google.protobuf.Timestamp", Ts.proto_full_name);
+    try std.testing.expectEqualStrings("google.protobuf.Duration", Dur.proto_full_name);
+    try std.testing.expectEqualStrings("google.protobuf.Any", Any.proto_full_name);
+
+    var buf: [32]u8 = undefined;
+    const ts = try Ts.parseRfc3339("2026-11-25T14:41:00.5Z");
+    try ts.validate();
+    try std.testing.expectEqualStrings("2026-11-25T14:41:00.500Z", try ts.formatRfc3339Buf(&buf));
+
+    const dur = try Dur.parseProtoJson("1.5s");
+    try dur.validate();
+    try std.testing.expectEqualStrings("1.500s", try dur.formatProtoJsonBuf(&buf));
+    const ts2 = try ts.addDuration(dur);
+    const diff = try ts2.diff(Dur, ts);
+    try std.testing.expectEqual(@as(i64, 1), diff.seconds);
+    try std.testing.expectEqual(@as(i32, 500_000_000), diff.nanos);
+
+    const ev = pb.SmallEvent{ .id = 99, .source = "wkt-delegate" };
+    var val_buf: [128]u8 = undefined;
+    const packed_any = try Any.packSlice(ev, &val_buf);
+    try std.testing.expect(packed_any.is(pb.SmallEvent));
+    try std.testing.expectEqualStrings(pb.SmallEvent.proto_full_name, packed_any.typeName().?);
+    const unpacked = try packed_any.unpack(pb.SmallEvent);
+    try std.testing.expectEqual(@as(u64, 99), unpacked.id);
+    try std.testing.expectEqualStrings("wkt-delegate", unpacked.source);
+}
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();

@@ -37,6 +37,75 @@ inline fn blackBoxMutSlice(s: []u8) []u8 {
     const vn: *volatile usize = &n;
     return vp.*[0..vn.*];
 }
+fn JsonCtx(comptime M: type) type {
+    return struct {
+        msg: *const M,
+        wire_bytes: []const u8,
+        json_bytes: []const u8,
+        out_buf: []u8,
+        arena_buf: []u8,
+    };
+}
+
+fn benchEncodeJson(comptime M: type) fn (JsonCtx(M)) void {
+    return struct {
+        fn run(ctx: JsonCtx(M)) void {
+            const msg = blackBoxPtr(M, ctx.msg);
+            const out_buf = blackBoxMutSlice(ctx.out_buf);
+            const out = msg.encodeJsonSlice(out_buf, .{}) catch unreachable;
+            std.mem.doNotOptimizeAway(out);
+        }
+    }.run;
+}
+
+fn benchWireToJson(comptime M: type) fn (JsonCtx(M)) void {
+    return struct {
+        fn run(ctx: JsonCtx(M)) void {
+            const wire_bytes = blackBoxSlice(ctx.wire_bytes);
+            const out_buf = blackBoxMutSlice(ctx.out_buf);
+            const view = M.decode(wire_bytes) catch unreachable;
+            const out = view.encodeJsonSlice(out_buf, .{}) catch unreachable;
+            std.mem.doNotOptimizeAway(out);
+        }
+    }.run;
+}
+
+fn benchDecodeJson(comptime M: type) fn (JsonCtx(M)) void {
+    return struct {
+        fn run(ctx: JsonCtx(M)) void {
+            const json_bytes = blackBoxSlice(ctx.json_bytes);
+            const arena_buf = blackBoxMutSlice(ctx.arena_buf);
+            var fba = std.heap.FixedBufferAllocator.init(arena_buf);
+            const decoded = M.decodeJson(fba.allocator(), json_bytes, .{}) catch unreachable;
+            std.mem.doNotOptimizeAway(decoded);
+        }
+    }.run;
+}
+
+fn runJsonSuite(
+    comptime M: type,
+    io: std.Io,
+    w: *std.Io.Writer,
+    filter: ?[]const u8,
+    prefix: []const u8,
+    iters: usize,
+    ctx: JsonCtx(M),
+) !void {
+    const ops = .{
+        .{ "encodeJsonSlice", benchEncodeJson(M) },
+        .{ "wire -> JSON transcode", benchWireToJson(M) },
+        .{ "decodeJson (stack FBA)", benchDecodeJson(M) },
+    };
+
+    var name_buf: [64]u8 = undefined;
+    inline for (ops) |entry| {
+        const full_name = std.fmt.bufPrint(&name_buf, "{s}/{s}", .{ prefix, entry[0] }) catch unreachable;
+        if (matchesFilter(filter, full_name)) {
+            const res = runBench(io, full_name, ctx.json_bytes.len, iters, ctx, entry[1]);
+            try printRow(w, res);
+        }
+    }
+}
 
 fn runBench(
     io: std.Io,
@@ -166,6 +235,38 @@ fn benchUserTraverse(ctx: Ctx(pb.UserProfile)) void {
     std.mem.doNotOptimizeAway(acc);
 }
 
+// User/decodeOnly (id + role): 16-byte stack projection, skips UTF-8, maps, and cyclic manager
+fn benchUserDecodeOnly(ctx: Ctx(pb.UserProfile)) void {
+    const bytes = blackBoxSlice(ctx.encoded);
+    const p = pb.UserProfile.decodeOnly(bytes, .{ .id, .role }) catch unreachable;
+    const acc = p.id +% @as(u64, @bitCast(@as(i64, @backingInt(p.role))));
+    std.mem.doNotOptimizeAway(acc);
+}
+
+// User/fieldIterator (early-exit id + role): stops scanning as soon as both fields are seen
+fn benchUserFieldIterEarlyExit(ctx: Ctx(pb.UserProfile)) void {
+    const bytes = blackBoxSlice(ctx.encoded);
+    var it = pb.UserProfile.fieldIterator(bytes);
+    var id: u64 = 0;
+    var role: i32 = 0;
+    var seen: u2 = 0;
+    while (it.next() catch unreachable) |item| {
+        switch (item) {
+            .id => |v| {
+                id = v;
+                seen |= 1;
+            },
+            .role => |v| {
+                role = @backingInt(v);
+                seen |= 2;
+            },
+            else => {},
+        }
+        if (seen == 3) break;
+    }
+    std.mem.doNotOptimizeAway(id +% @as(u64, @bitCast(@as(i64, role))));
+}
+
 fn benchBatchTraverse(ctx: Ctx(pb.TelemetryBatch)) void {
     const bytes = blackBoxSlice(ctx.encoded);
     const d = pb.TelemetryBatch.decode(bytes) catch unreachable;
@@ -183,6 +284,28 @@ fn benchBatchTraverse(ctx: Ctx(pb.TelemetryBatch)) void {
     std.mem.doNotOptimizeAway(acc);
 }
 
+// Batch/decodeOnly (host only): skips ~3 KB of packed deltas, hashes, and 64 Point submessages
+fn benchBatchDecodeOnlyHost(ctx: Ctx(pb.TelemetryBatch)) void {
+    const bytes = blackBoxSlice(ctx.encoded);
+    const p = pb.TelemetryBatch.decodeOnly(bytes, .{.host}) catch unreachable;
+    std.mem.doNotOptimizeAway(p.host.len);
+}
+
+// Batch/fieldIterator (sum deltas): streams packed ZigZag sint64s without touching hashes or points
+fn benchBatchFieldIterDeltas(ctx: Ctx(pb.TelemetryBatch)) void {
+    const bytes = blackBoxSlice(ctx.encoded);
+    var it = pb.TelemetryBatch.fieldIterator(bytes);
+    var sum: u64 = 0;
+    while (it.next() catch unreachable) |item| switch (item) {
+        .deltas => |chunk| {
+            var cit = chunk.iterator();
+            while (cit.next() catch unreachable) |v| sum +%= @bitCast(v);
+        },
+        else => {},
+    };
+    std.mem.doNotOptimizeAway(sum);
+}
+
 fn matchesFilter(filter: ?[]const u8, label: []const u8) bool {
     const f = filter orelse return true;
     return std.mem.indexOf(u8, label, f) != null;
@@ -197,6 +320,22 @@ fn printRow(w: *std.Io.Writer, r: BenchResult) !void {
         r.mops_s,
         r.mb_s,
     });
+}
+
+fn runExtra(
+    comptime M: type,
+    io: std.Io,
+    w: *std.Io.Writer,
+    filter: ?[]const u8,
+    label: []const u8,
+    iters: usize,
+    ctx: Ctx(M),
+    comptime func: fn (Ctx(M)) void,
+) !void {
+    if (matchesFilter(filter, label)) {
+        const res = runBench(io, label, ctx.encoded.len, iters, ctx, func);
+        try printRow(w, res);
+    }
 }
 
 fn runSuite(
@@ -277,6 +416,18 @@ pub fn main(init: std.process.Init) !void {
             .encoded = encoded,
             .scratch = &scratch,
         }, null);
+
+        var json_buf: [256]u8 = undefined;
+        var json_scratch: [256]u8 = undefined;
+        var zero_arena: [0]u8 = .{}; // 0 bytes proves flat decodeJson allocates nothing
+        const json_encoded = try small.encodeJsonSlice(&json_buf, .{});
+        try runJsonSuite(pb.SmallEvent, init.io, w, filter, "Small", 500_000, .{
+            .msg = &small,
+            .wire_bytes = encoded,
+            .json_bytes = json_encoded,
+            .out_buf = &json_scratch,
+            .arena_buf = &zero_arena,
+        });
     }
 
     // --- Tier 2: UserProfile ---
@@ -307,12 +458,31 @@ pub fn main(init: std.process.Init) !void {
         const encoded = try user.encodeSlice(&wire_buf);
         try verifyTier(pb.UserProfile, &user, encoded);
 
-        try w.writeAll("------------------------------------------------------------------------------------------\n");
-        try runSuite(pb.UserProfile, init.io, w, filter, "User", 500_000, .{
+        const user_proj = try pb.UserProfile.decodeOnly(encoded, .{ .id, .role });
+        if (user_proj.id != user.id or user_proj.role != user.role) return error.DecodeOnlyMismatch;
+
+        const ctx: Ctx(pb.UserProfile) = .{
             .msg = &user,
             .encoded = encoded,
             .scratch = &scratch,
-        }, benchUserTraverse);
+        };
+
+        try w.writeAll("------------------------------------------------------------------------------------------\n");
+        try runSuite(pb.UserProfile, init.io, w, filter, "User", 500_000, ctx, benchUserTraverse);
+        try runExtra(pb.UserProfile, init.io, w, filter, "User/decodeOnly (id + role)", 1_000_000, ctx, benchUserDecodeOnly);
+        try runExtra(pb.UserProfile, init.io, w, filter, "User/fieldIterator (early-exit)", 1_000_000, ctx, benchUserFieldIterEarlyExit);
+
+        var json_buf: [1024]u8 = undefined;
+        var json_scratch: [1024]u8 = undefined;
+        var json_arena: [2048]u8 = undefined;
+        const json_encoded = try user.encodeJsonSlice(&json_buf, .{});
+        try runJsonSuite(pb.UserProfile, init.io, w, filter, "User", 100_000, .{
+            .msg = &user,
+            .wire_bytes = encoded,
+            .json_bytes = json_encoded,
+            .out_buf = &json_scratch,
+            .arena_buf = &json_arena,
+        });
     }
 
     // --- Tier 3: TelemetryBatch ---
@@ -346,12 +516,31 @@ pub fn main(init: std.process.Init) !void {
         const encoded = try batch.encodeSlice(&wire_buf);
         try verifyTier(pb.TelemetryBatch, &batch, encoded);
 
-        try w.writeAll("------------------------------------------------------------------------------------------\n");
-        try runSuite(pb.TelemetryBatch, init.io, w, filter, "Batch", 50_000, .{
+        const batch_proj = try pb.TelemetryBatch.decodeOnly(encoded, .{.host});
+        if (!std.mem.eql(u8, batch_proj.host, batch.host)) return error.DecodeOnlyMismatch;
+
+        const ctx: Ctx(pb.TelemetryBatch) = .{
             .msg = &batch,
             .encoded = encoded,
             .scratch = &scratch,
-        }, benchBatchTraverse);
+        };
+
+        try w.writeAll("------------------------------------------------------------------------------------------\n");
+        try runSuite(pb.TelemetryBatch, init.io, w, filter, "Batch", 50_000, ctx, benchBatchTraverse);
+        try runExtra(pb.TelemetryBatch, init.io, w, filter, "Batch/decodeOnly (host only)", 200_000, ctx, benchBatchDecodeOnlyHost);
+        try runExtra(pb.TelemetryBatch, init.io, w, filter, "Batch/fieldIterator (sum deltas)", 100_000, ctx, benchBatchFieldIterDeltas);
+
+        var json_buf: [16384]u8 = undefined;
+        var json_scratch: [16384]u8 = undefined;
+        var json_arena: [16384]u8 = undefined;
+        const json_encoded = try batch.encodeJsonSlice(&json_buf, .{});
+        try runJsonSuite(pb.TelemetryBatch, init.io, w, filter, "Batch", 10_000, .{
+            .msg = &batch,
+            .wire_bytes = encoded,
+            .json_bytes = json_encoded,
+            .out_buf = &json_scratch,
+            .arena_buf = &json_arena,
+        });
     }
 
     try w.writeAll("==========================================================================================\n");

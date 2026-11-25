@@ -1,0 +1,18 @@
+edition = "2023";
+package stress.editions;
+
+option features.field_presence = EXPLICIT;
+option features.repeated_field_encoding = EXPANDED;
+option features.utf8_validation = NONE;
+
+message EditionConfig {
+  string raw_non_utf8 = 1;
+  string strict_utf8 = 2 [features.utf8_validation = VERIFY];
+  int32 count = 3;
+  int32 implicit_count = 4 [features.field_presence = IMPLICIT];
+  repeated int32 expanded_nums = 5;
+  repeated int32 packed_nums = 6 [features.repeated_field_encoding = PACKED];
+
+  reserved 99;
+  reserved retired_edition_col;
+}

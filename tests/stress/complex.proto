@@ -1,0 +1,148 @@
+syntax = "proto3";
+package stress.v1;
+
+import "facade/public_bridge.proto";
+import "legacy/proto2_ext.proto";
+import "editions/ed2023.proto";
+import "google/protobuf/any.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/empty.proto";
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/wrappers.proto";
+
+// Scope shadowing target
+message Inner {
+  string from_top = 1;
+}
+
+message Outer {
+  message Inner {
+    int32 from_outer = 1;
+  }
+  Inner shadowed = 1;
+  .stress.v1.Inner explicit_root = 2;
+}
+
+// Mutual recursion across messages
+message CycleA {
+  string name = 1;
+  CycleB b = 2;
+  repeated CycleB b_list = 3;
+  map<string, CycleB> b_map = 4;
+}
+
+message CycleB {
+  int32 code = 1;
+  CycleA a = 2;
+}
+
+// 4-level deep nesting
+message Level1 {
+  message Level2 {
+    message Level3 {
+      message Level4 {
+        fixed64 leaf_id = 1;
+        repeated string notes = 2;
+      }
+      Level4 l4 = 1;
+    }
+    Level3 l3 = 1;
+  }
+  Level2 l2 = 1;
+}
+
+// Method/member name collisions with generated code (`encode` -> `encode_`, `decode` -> `decode_`, etc.)
+message MethodCollision {
+  string encode = 1;
+  string decode = 2;
+  string proto_full_name = 3;
+  string _unknown_fields = 4;
+}
+
+message MegaEnvelope {
+  // All 15 scalars (implicit)
+  double s_double = 1;
+  float s_float = 2;
+  int32 s_int32 = 3;
+  int64 s_int64 = 4;
+  uint32 s_uint32 = 5;
+  uint64 s_uint64 = 6;
+  sint32 s_sint32 = 7;
+  sint64 s_sint64 = 8;
+  fixed32 s_fixed32 = 9;
+  fixed64 s_fixed64 = 10;
+  sfixed32 s_sfixed32 = 11;
+  sfixed64 s_sfixed64 = 12;
+  bool s_bool = 13;
+  string s_string = 14;
+  bytes s_bytes = 15;
+
+  // Explicit proto3 optional scalars & enum
+  optional int64 opt_i64 = 16;
+  optional bool opt_bool = 17;
+  optional string opt_str = 18;
+  optional stress.base.StatusFlag opt_flag = 19;
+
+  // Repeated fields
+  repeated sint64 rep_sint64 = 20;
+  repeated fixed32 rep_fixed32 = 21;
+  repeated string rep_strings = 22;
+  repeated bytes rep_bytes = 23;
+  repeated stress.base.KeywordEnum rep_enums = 24;
+  repeated Level1.Level2.Level3.Level4 rep_l4 = 25;
+
+  // All 12 valid map key types
+  map<int32, string> map_i32 = 30;
+  map<int64, bytes> map_i64 = 31;
+  map<uint32, double> map_u32 = 32;
+  map<uint64, bool> map_u64 = 33;
+  map<sint32, sint64> map_si32 = 34;
+  map<sint64, fixed32> map_si64 = 35;
+  map<fixed32, fixed64> map_f32 = 36;
+  map<fixed64, sfixed32> map_f64 = 37;
+  map<sfixed32, sfixed64> map_sf32 = 38;
+  map<sfixed64, stress.base.StatusFlag> map_sf64 = 39;
+  map<bool, Outer.Inner> map_bool = 40;
+  map<string, google.protobuf.Timestamp> map_str_ts = 41;
+
+  // Multi-oneof
+  oneof payload_one {
+    string text_payload = 50;
+    bytes raw_payload = 51;
+    Level1 nested_payload = 52;
+    google.protobuf.Duration duration_payload = 53;
+  }
+  oneof payload_two {
+    sint32 delta = 54;
+    stress.base.type kw_msg = 55;
+  }
+
+  // Transitive import public + cross-syntax + WKTs
+  stress.facade.EmptyMarker bridged_shadow = 60;
+  stress.base.EmptyMarker base_empty = 61;
+  stress.base.TreeNode tree = 62;
+  stress.legacy.LegacyRecord legacy = 63;
+  stress.editions.EditionConfig edition_cfg = 64;
+  Outer scope_test = 65;
+  CycleA mutual_cycle = 66;
+  MethodCollision collisions = 67;
+
+  google.protobuf.Timestamp ts = 70;
+  google.protobuf.Duration dur = 71;
+  google.protobuf.Any any_val = 72;
+  google.protobuf.Struct struct_val = 73;
+  google.protobuf.FieldMask mask_val = 74;
+  google.protobuf.Int64Value wrap_i64 = 75;
+  google.protobuf.StringValue wrap_str = 76;
+
+  // Max valid protobuf field number (2^29 - 1)
+  uint32 max_field_num = 536870911;
+}
+
+service MegaGateway {
+  rpc Process (MegaEnvelope) returns (google.protobuf.Empty);
+  rpc CheckLegacy (stress.legacy.LegacyRecord) returns (stress.editions.EditionConfig);
+  rpc StreamTrees (stream stress.base.TreeNode) returns (stream stress.base.TreeNode);
+  rpc test (MethodCollision) returns (Outer);
+}
