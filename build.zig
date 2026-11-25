@@ -119,4 +119,34 @@ pub fn build(b: *std.Build) void {
     run_bench.addPassthruArgs();
     b.step("bench", "Run zero-allocation protobuf benchmarks (pass -Doptimize=ReleaseFast)")
         .dependOn(&run_bench.step);
+
+    // 6. Cross-platform malformed-wire + PRNG property fuzz tests (`zig build test` & `zig build fuzz`)
+    const fuzz_imports: []const std.Build.Module.Import = &.{
+        .{ .name = "proto_wire", .module = wire_mod },
+        .{ .name = "bench_pb", .module = bench_pb.module },
+        .{ .name = "proto_wkt", .module = wkt_pkg.module },
+    };
+    const fuzz_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/fuzz.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = fuzz_imports,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(fuzz_tests).step);
+
+    const fuzz_exe = b.addExecutable(.{
+        .name = "protoz-fuzz",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/fuzz.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = fuzz_imports,
+        }),
+    });
+    const run_fuzz = b.addRunArtifact(fuzz_exe);
+    run_fuzz.addPassthruArgs();
+    b.step("fuzz", "Run cross-platform PRNG mutation & structured round-trip fuzzer (-- --iters N --seed S)")
+        .dependOn(&run_fuzz.step);
 }
