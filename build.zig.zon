@@ -74,6 +74,7 @@
         "build_proto.zig",
         "src",
         "bench",
+        "tests",
         "include",
         "LICENSE",
     },

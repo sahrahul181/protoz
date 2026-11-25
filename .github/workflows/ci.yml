@@ -21,7 +21,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: mlugg/setup-zig@v2
       - name: Check Zig formatting
-        run: zig fmt --check build.zig build_proto.zig src bench
+        run: zig fmt --check build.zig build_proto.zig src bench tests
 
   test:
     name: Build & Test (${{ matrix.os }})
@@ -53,3 +53,6 @@ jobs:
 
       - name: Run ReleaseFast benchmarks
         run: zig build bench -Doptimize=ReleaseFast
+
+      - name: Run cross-platform PRNG fuzzer
+        run: zig build fuzz -Doptimize=ReleaseFast -- --iters 50000
