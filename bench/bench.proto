@@ -1,0 +1,56 @@
+syntax = "proto3";
+package protoz.bench.v1;
+
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+  ROLE_ADMIN = 1;
+  ROLE_MEMBER = 2;
+}
+
+// Tier 1: Small flat telemetry event (~35 bytes) — measures peak Mops/s & per-call floor.
+message SmallEvent {
+  uint64 id = 1;
+  int64 timestamp_ns = 2;
+  uint32 status = 3;
+  string source = 4;
+}
+
+// Tier 2: Medium rich RPC payload (~170 bytes) — exercises packed repeated,
+// repeated strings, maps, nested messages, explicit presence, oneofs, UTF-8, and Lazy cycles.
+message UserProfile {
+  message Address {
+    string city = 1;
+    uint32 zip = 2;
+  }
+
+  uint64 id = 1;
+  string name = 2;
+  Role role = 3;
+  repeated uint32 scores = 4;
+  repeated string tags = 5;
+  map<string, int32> quotas = 6;
+  Address address = 7;
+  optional bool verified = 8;
+
+  oneof contact {
+    string email = 9;
+    string phone = 10;
+  }
+
+  UserProfile manager = 11;
+}
+
+// Tier 3: Large batch payload (~2.8 KB) — measures sustained wire bandwidth (GB/s)
+// across packed ZigZag varints, packed fixed64s, and repeated submessages.
+message TelemetryBatch {
+  message Point {
+    uint64 ts = 1;
+    double value = 2;
+    string label = 3;
+  }
+
+  string host = 1;
+  repeated sint64 deltas = 2;
+  repeated fixed64 hashes = 3;
+  repeated Point points = 4;
+}

@@ -1,6 +1,7 @@
 const std = @import("std");
 
 pub const max_recursion_depth: u32 = 100;
+pub const max_merge_chunks: usize = 8;
 
 pub const WireType = enum(u3) {
     varint = 0,
@@ -28,6 +29,8 @@ pub const DecodeError = error{
     WireTypeMismatch,
     UnmatchedEndGroup,
     RecursionLimitExceeded,
+    InvalidUtf8,
+    MergeChunkLimitExceeded,
 };
 
 pub inline fn rawTag(comptime field_number: u29, comptime wt: WireType) u32 {
@@ -305,7 +308,11 @@ pub const Reader = struct {
             if (self.ptr == self.end) return error.UnexpectedEof;
             const b = self.ptr[0];
             self.ptr += 1;
-            if (count == 9 and b > 1) return error.VarintOverflow;
+            if (count == 9) {
+                if (b >= 0x80) return error.VarintOverflow;
+                result |= @as(u64, b & 0x01) << 63;
+                return result;
+            }
             const shift: u6 = @intCast(count * 7);
             result |= @as(u64, b & 0x7F) << shift;
             if (b < 0x80) return result;
@@ -332,7 +339,7 @@ pub const Reader = struct {
             const b = self.ptr[0];
             self.ptr += 1;
             if (count == 9) {
-                if (b > 1) return error.VarintOverflow;
+                if (b >= 0x80) return error.VarintOverflow;
                 return;
             }
             if (b < 0x80) return;
@@ -441,7 +448,7 @@ pub fn validatePackedVarints(payload: []const u8) DecodeError!void {
             const b = p[0];
             p += 1;
             if (count == 9) {
-                if (b > 1) return error.VarintOverflow;
+                if (b >= 0x80) return error.VarintOverflow;
                 break;
             }
             if (b < 0x80) break;
@@ -449,21 +456,68 @@ pub fn validatePackedVarints(payload: []const u8) DecodeError!void {
     }
 }
 
-inline fn extendWindow(
-    prev: []const u8,
-    msg_start: [*]const u8,
-    tag_ptr: [*]const u8,
-    end_ptr: [*]const u8,
-) []const u8 {
+inline fn canExtendPtr(prev_ptr: [*]const u8, msg_start: [*]const u8, tag_ptr: [*]const u8) bool {
     const base = @intFromPtr(msg_start);
-    const p = @intFromPtr(prev.ptr);
+    const p = @intFromPtr(prev_ptr);
     const t = @intFromPtr(tag_ptr);
-    if (p >= base and p <= t) {
-        @branchHint(.likely);
-        return prev.ptr[0 .. @intFromPtr(end_ptr) - p];
-    }
-    return tag_ptr[0 .. @intFromPtr(end_ptr) - t];
+    return p >= base and p <= t;
 }
+
+/// Inline zero-allocation chunk list preserving disjoint slices across merged submessage chunks.
+pub const WireChunks = struct {
+    ptrs: [max_merge_chunks][*]const u8,
+    lens: [max_merge_chunks]u32,
+    field_number: u29,
+    len: u4,
+    /// Bit `i` is 1 when chunk `i` is a raw payload (packed repeated / Lazy raw),
+    /// and 0 when chunk `i` is a tagged wire window.
+    packed_mask: u8 = 0,
+
+    pub inline fn init(field_number: u29) WireChunks {
+        return .{
+            .ptrs = undefined,
+            .lens = undefined,
+            .field_number = field_number,
+            .len = 0,
+            .packed_mask = 0,
+        };
+    }
+
+    pub inline fn sliceAt(self: *const WireChunks, idx: usize) []const u8 {
+        return self.ptrs[idx][0..self.lens[idx]];
+    }
+
+    pub inline fn isPackedChunk(self: *const WireChunks, idx: usize) bool {
+        return (self.packed_mask & (@as(u8, 1) << @as(u3, @intCast(idx)))) != 0;
+    }
+
+    pub fn append(self: *WireChunks, data: []const u8, is_packed: bool) DecodeError!void {
+        if (self.len >= max_merge_chunks) return error.MergeChunkLimitExceeded;
+        const n = std.math.cast(u32, data.len) orelse return error.UnexpectedEof;
+        const idx: usize = self.len;
+        self.ptrs[idx] = data.ptr;
+        self.lens[idx] = n;
+        if (is_packed) self.packed_mask |= (@as(u8, 1) << @as(u3, @intCast(idx)));
+        self.len += 1;
+    }
+
+    pub fn tryExtendLast(
+        self: *WireChunks,
+        msg_start: [*]const u8,
+        tag_ptr: [*]const u8,
+        end_ptr: [*]const u8,
+    ) DecodeError!bool {
+        if (self.len == 0) return false;
+        const last_idx: usize = self.len - 1;
+        if (self.isPackedChunk(last_idx)) return false;
+        if (canExtendPtr(self.ptrs[last_idx], msg_start, tag_ptr)) {
+            const new_len = @intFromPtr(end_ptr) - @intFromPtr(self.ptrs[last_idx]);
+            self.lens[last_idx] = std.math.cast(u32, new_len) orelse return error.UnexpectedEof;
+            return true;
+        }
+        return false;
+    }
+};
 
 // --- Comptime Field Codecs ---
 
@@ -482,6 +536,7 @@ pub const ScalarKind = enum {
     sfixed64,
     double_,
     string,
+    string_utf8,
     bytes,
 };
 
@@ -495,17 +550,18 @@ pub fn ScalarCodec(comptime kind: ScalarKind) type {
             .bool_ => bool,
             .float_ => f32,
             .double_ => f64,
-            .string, .bytes => []const u8,
+            .string, .string_utf8, .bytes => []const u8,
         };
 
         pub const wire_type: WireType = switch (kind) {
             .int32, .int64, .uint32, .uint64, .sint32, .sint64, .bool_ => .varint,
             .fixed32, .sfixed32, .float_ => .i32,
             .fixed64, .sfixed64, .double_ => .i64,
-            .string, .bytes => .len,
+            .string, .string_utf8, .bytes => .len,
         };
 
         pub const is_packable: bool = (wire_type != .len);
+        pub const is_message: bool = false;
 
         pub const fixed_size: ?usize = switch (wire_type) {
             .i32 => 4,
@@ -516,7 +572,7 @@ pub fn ScalarCodec(comptime kind: ScalarKind) type {
         pub const default_value: T = switch (kind) {
             .bool_ => false,
             .float_, .double_ => 0.0,
-            .string, .bytes => "",
+            .string, .string_utf8, .bytes => "",
             else => 0,
         };
 
@@ -525,7 +581,7 @@ pub fn ScalarCodec(comptime kind: ScalarKind) type {
                 .bool_ => !v,
                 .float_ => @as(u32, @bitCast(v)) == 0,
                 .double_ => @as(u64, @bitCast(v)) == 0,
-                .string, .bytes => v.len == 0,
+                .string, .string_utf8, .bytes => v.len == 0,
                 else => v == 0,
             };
         }
@@ -540,7 +596,7 @@ pub fn ScalarCodec(comptime kind: ScalarKind) type {
                 .bool_ => 1,
                 .fixed32, .sfixed32, .float_ => 4,
                 .fixed64, .sfixed64, .double_ => 8,
-                .string, .bytes => varintSize(v.len) + v.len,
+                .string, .string_utf8, .bytes => varintSize(v.len) + v.len,
             };
         }
 
@@ -556,7 +612,7 @@ pub fn ScalarCodec(comptime kind: ScalarKind) type {
                 .sfixed32, .float_ => try writeFixed32(w, @bitCast(v)),
                 .fixed64 => try writeFixed64(w, v),
                 .sfixed64, .double_ => try writeFixed64(w, @bitCast(v)),
-                .string, .bytes => try writeBytes(w, v),
+                .string, .string_utf8, .bytes => try writeBytes(w, v),
             }
         }
 
@@ -572,7 +628,7 @@ pub fn ScalarCodec(comptime kind: ScalarKind) type {
                 .sfixed32, .float_ => try rw.writeFixed32(@bitCast(v)),
                 .fixed64 => try rw.writeFixed64(v),
                 .sfixed64, .double_ => try rw.writeFixed64(@bitCast(v)),
-                .string, .bytes => try rw.writeBytes(v),
+                .string, .string_utf8, .bytes => try rw.writeBytes(v),
             }
         }
 
@@ -591,6 +647,14 @@ pub fn ScalarCodec(comptime kind: ScalarKind) type {
                 .fixed64 => try r.readFixed64(),
                 .sfixed64, .double_ => @bitCast(try r.readFixed64()),
                 .string, .bytes => try r.readBytes(),
+                .string_utf8 => blk: {
+                    const s = try r.readBytes();
+                    if (!std.unicode.utf8ValidateSlice(s)) {
+                        @branchHint(.unlikely);
+                        return error.InvalidUtf8;
+                    }
+                    break :blk s;
+                },
             };
         }
 
@@ -600,7 +664,15 @@ pub fn ScalarCodec(comptime kind: ScalarKind) type {
                 .varint => try r.skipVarint(),
                 .i32 => try r.skipFixed(4),
                 .i64 => try r.skipFixed(8),
-                .len => _ = try r.readBytes(),
+                .len => {
+                    const s = try r.readBytes();
+                    if (comptime kind == .string_utf8) {
+                        if (!std.unicode.utf8ValidateSlice(s)) {
+                            @branchHint(.unlikely);
+                            return error.InvalidUtf8;
+                        }
+                    }
+                },
                 else => unreachable,
             }
         }
@@ -613,6 +685,7 @@ pub fn EnumCodec(comptime E: type) type {
         pub const T = E;
         pub const wire_type: WireType = .varint;
         pub const is_packable: bool = true;
+        pub const is_message: bool = false;
         pub const fixed_size: ?usize = null;
         pub const default_value: T = @fromBackingInt(0);
 
@@ -651,6 +724,7 @@ pub fn MessageCodec(comptime M: type) type {
         pub const T = M;
         pub const wire_type: WireType = .len;
         pub const is_packable: bool = false;
+        pub const is_message: bool = true;
         pub const fixed_size: ?usize = null;
         pub const default_value: T = .{};
 
@@ -678,6 +752,10 @@ pub fn MessageCodec(comptime M: type) type {
             return M.decodeDepth(try r.readBytes(), depth);
         }
 
+        pub fn mergeRead(dst: *T, r: *Reader, depth: u32) DecodeError!void {
+            try dst.mergeDepth(try r.readBytes(), depth);
+        }
+
         pub fn validate(r: *Reader, depth: u32) DecodeError!void {
             try M.validateDepth(try r.readBytes(), depth);
         }
@@ -686,16 +764,40 @@ pub fn MessageCodec(comptime M: type) type {
 
 // --- Zero-Allocation Containers: Lazy, Repeated, Map ---
 
-/// Breaks recursive message cycles without heap allocation.
+/// Breaks recursive message cycles without heap allocation while preserving multi-occurrence merging.
 pub fn Lazy(comptime M: type) type {
+    @setEvalBranchQuota(100_000);
     return union(enum) {
         raw: []const u8,
         ptr: *const M,
-        wire: WireFieldView, // used only when a cyclic field appears multiple times
+        wire: WireFieldView,
+        chunks: WireChunks,
+
+        pub fn mergeRaw(self: *@This(), sub_bytes: []const u8, field_number: u29) DecodeError!void {
+            @branchHint(.cold);
+            switch (self.*) {
+                .raw => |prev| {
+                    var c = WireChunks.init(field_number);
+                    try c.append(prev, true);
+                    try c.append(sub_bytes, true);
+                    self.* = .{ .chunks = c };
+                },
+                .chunks => |*c| {
+                    try c.append(sub_bytes, true);
+                },
+                .ptr, .wire => {
+                    self.* = .{ .raw = sub_bytes };
+                },
+            }
+        }
 
         pub fn decode(self: @This()) DecodeError!M {
+            return self.decodeDepth(max_recursion_depth);
+        }
+
+        pub fn decodeDepth(self: @This(), depth: u32) DecodeError!M {
             return switch (self) {
-                .raw => |b| M.decode(b),
+                .raw => |b| M.decodeDepth(b, depth),
                 .ptr => |p| p.*,
                 .wire => |w| blk: {
                     var msg: M = .{};
@@ -703,11 +805,18 @@ pub fn Lazy(comptime M: type) type {
                     const expected_raw: u32 = (@as(u32, w.field_number) << 3) | @backingInt(WireType.len);
                     while (try r.readRawTag()) |raw_tag| {
                         if (raw_tag == expected_raw) {
-                            try msg.mergeDepth(try r.readBytes(), max_recursion_depth);
+                            try msg.mergeDepth(try r.readBytes(), depth);
                         } else {
                             const tag = try decodeTag(raw_tag);
-                            try r.skipField(tag, max_recursion_depth);
+                            try r.skipField(tag, depth);
                         }
+                    }
+                    break :blk msg;
+                },
+                .chunks => |c| blk: {
+                    var msg: M = .{};
+                    for (0..c.len) |i| {
+                        try msg.mergeDepth(c.sliceAt(i), depth);
                     }
                     break :blk msg;
                 },
@@ -719,6 +828,11 @@ pub fn Lazy(comptime M: type) type {
                 .raw => |b| b.len,
                 .ptr => |p| p.encodedSize(),
                 .wire => (self.decode() catch return 0).encodedSize(),
+                .chunks => |c| blk: {
+                    var total: usize = 0;
+                    for (0..c.len) |i| total += c.lens[i];
+                    break :blk total;
+                },
             };
         }
 
@@ -730,6 +844,9 @@ pub fn Lazy(comptime M: type) type {
                     const merged = self.decode() catch unreachable;
                     try merged.encode(w);
                 },
+                .chunks => |c| {
+                    for (0..c.len) |i| try w.writeAll(c.sliceAt(i));
+                },
             }
         }
 
@@ -740,6 +857,13 @@ pub fn Lazy(comptime M: type) type {
                 .wire => {
                     const merged = self.decode() catch unreachable;
                     try merged.encodeReverse(rw);
+                },
+                .chunks => |c| {
+                    var i: usize = c.len;
+                    while (i > 0) {
+                        i -= 1;
+                        try rw.writeAll(c.sliceAt(i));
+                    }
                 },
             }
         }
@@ -756,12 +880,15 @@ pub const WireFieldView = struct {
     field_number: u29,
 };
 
-/// Zero-allocation repeated field with direct packed-slice fast path and tight wire windows.
+/// Zero-allocation repeated field with packed-slice fast path, tight wire windows,
+/// and lossless multi-chunk submessage merging.
 pub fn Repeated(comptime Codec: type) type {
+    @setEvalBranchQuota(100_000);
     return union(enum) {
         slice: []const Codec.T,
         packed_slice: PackedSlice,
         wire: WireFieldView,
+        chunks: WireChunks,
 
         pub const empty: @This() = .{ .slice = &.{} };
 
@@ -772,6 +899,13 @@ pub fn Repeated(comptime Codec: type) type {
                 wire: struct {
                     reader: Reader,
                     field_number: u29,
+                    packed_reader: ?Reader = null,
+                },
+                chunks: struct {
+                    chunks: WireChunks,
+                    chunk_idx: usize = 0,
+                    reader: Reader = Reader.init(&.{}),
+                    in_packed_chunk: bool = false,
                     packed_reader: ?Reader = null,
                 },
             },
@@ -789,6 +923,7 @@ pub fn Repeated(comptime Codec: type) type {
                         return try Codec.read(pr, max_recursion_depth);
                     },
                     .wire => |*w| return nextWire(w),
+                    .chunks => |*c| return nextChunks(c),
                 }
             }
 
@@ -815,6 +950,42 @@ pub fn Repeated(comptime Codec: type) type {
                     try w.reader.skipField(tag, max_recursion_depth);
                 }
             }
+
+            fn nextChunks(c: anytype) DecodeError!?Codec.T {
+                const expected_unpacked: u32 = (@as(u32, c.chunks.field_number) << 3) | @backingInt(Codec.wire_type);
+                const expected_packed: u32 = (@as(u32, c.chunks.field_number) << 3) | @backingInt(WireType.len);
+                while (true) {
+                    if (c.packed_reader) |*pr| {
+                        if (!pr.eof()) return try Codec.read(pr, max_recursion_depth);
+                        c.packed_reader = null;
+                    }
+                    if (c.in_packed_chunk) {
+                        if (!c.reader.eof()) return try Codec.read(&c.reader, max_recursion_depth);
+                        c.in_packed_chunk = false;
+                    }
+                    if (!c.reader.eof()) {
+                        const raw_tag = (try c.reader.readRawTag()) orelse continue;
+                        if (raw_tag == expected_unpacked) {
+                            return try Codec.read(&c.reader, max_recursion_depth);
+                        }
+                        if (comptime Codec.is_packable) {
+                            if (raw_tag == expected_packed) {
+                                c.packed_reader = Reader.init(try c.reader.readBytes());
+                                continue;
+                            }
+                        }
+                        const tag = try decodeTag(raw_tag);
+                        if (tag.field_number == c.chunks.field_number) return error.WireTypeMismatch;
+                        try c.reader.skipField(tag, max_recursion_depth);
+                        continue;
+                    }
+                    if (c.chunk_idx >= c.chunks.len) return null;
+                    const idx = c.chunk_idx;
+                    c.chunk_idx += 1;
+                    c.reader = Reader.init(c.chunks.sliceAt(idx));
+                    c.in_packed_chunk = c.chunks.isPackedChunk(idx);
+                }
+            }
         };
 
         pub inline fn iterator(self: @This()) Iterator {
@@ -825,6 +996,7 @@ pub fn Repeated(comptime Codec: type) type {
                     .reader = Reader.init(w.buf),
                     .field_number = w.field_number,
                 } } },
+                .chunks => |c| .{ .source = .{ .chunks = .{ .chunks = c } } },
             };
         }
 
@@ -853,7 +1025,7 @@ pub fn Repeated(comptime Codec: type) type {
                 self.* = .{ .packed_slice = .{ .data = payload, .tag_ptr = tag_ptr } };
                 return;
             }
-            self.mergePackedSlow(msg_start, tag_ptr, payload, r.ptr, field_number);
+            try self.mergePackedSlow(msg_start, tag_ptr, payload, r.ptr, field_number);
         }
 
         fn mergePackedSlow(
@@ -863,31 +1035,40 @@ pub fn Repeated(comptime Codec: type) type {
             payload: []const u8,
             end_ptr: [*]const u8,
             field_number: u29,
-        ) void {
+        ) DecodeError!void {
             @branchHint(.cold);
+            if (payload.len == 0) return;
             switch (self.*) {
                 .slice => unreachable,
                 .packed_slice => |prev| {
                     if (prev.data.len == 0) {
                         self.* = .{ .packed_slice = .{ .data = payload, .tag_ptr = tag_ptr } };
-                    } else if (payload.len == 0) {
-                        // Trailing empty packed chunk adds no elements.
+                    } else if (canExtendPtr(prev.tag_ptr, msg_start, tag_ptr)) {
+                        self.* = .{ .wire = .{
+                            .buf = prev.tag_ptr[0 .. @intFromPtr(end_ptr) - @intFromPtr(prev.tag_ptr)],
+                            .field_number = field_number,
+                        } };
                     } else {
-                        const base = @intFromPtr(msg_start);
-                        const p = @intFromPtr(prev.tag_ptr);
-                        const t = @intFromPtr(tag_ptr);
-                        if (p >= base and p <= t) {
-                            self.* = .{ .wire = .{
-                                .buf = prev.tag_ptr[0 .. @intFromPtr(end_ptr) - p],
-                                .field_number = field_number,
-                            } };
-                        } else {
-                            self.* = .{ .packed_slice = .{ .data = payload, .tag_ptr = tag_ptr } };
-                        }
+                        var c = WireChunks.init(field_number);
+                        try c.append(prev.data, true);
+                        try c.append(payload, true);
+                        self.* = .{ .chunks = c };
                     }
                 },
                 .wire => |*prev| {
-                    prev.buf = extendWindow(prev.buf, msg_start, tag_ptr, end_ptr);
+                    if (canExtendPtr(prev.buf.ptr, msg_start, tag_ptr)) {
+                        prev.buf = prev.buf.ptr[0 .. @intFromPtr(end_ptr) - @intFromPtr(prev.buf.ptr)];
+                    } else {
+                        var c = WireChunks.init(field_number);
+                        try c.append(prev.buf, false);
+                        try c.append(payload, true);
+                        self.* = .{ .chunks = c };
+                    }
+                },
+                .chunks => |*c| {
+                    if (!try c.tryExtendLast(msg_start, tag_ptr, end_ptr)) {
+                        try c.append(payload, true);
+                    }
                 },
             }
         }
@@ -901,18 +1082,32 @@ pub fn Repeated(comptime Codec: type) type {
             depth: u32,
         ) DecodeError!void {
             try Codec.validate(r, depth);
+            const elem_slice = tag_ptr[0 .. @intFromPtr(r.ptr) - @intFromPtr(tag_ptr)];
             switch (self.*) {
                 .slice => {
                     self.* = .{ .wire = .{
-                        .buf = tag_ptr[0 .. @intFromPtr(r.ptr) - @intFromPtr(tag_ptr)],
+                        .buf = elem_slice,
                         .field_number = field_number,
                     } };
                 },
                 .wire => |*prev| {
-                    prev.buf = extendWindow(prev.buf, msg_start, tag_ptr, r.ptr);
+                    if (canExtendPtr(prev.buf.ptr, msg_start, tag_ptr)) {
+                        @branchHint(.likely);
+                        prev.buf = prev.buf.ptr[0 .. @intFromPtr(r.ptr) - @intFromPtr(prev.buf.ptr)];
+                    } else {
+                        var c = WireChunks.init(field_number);
+                        try c.append(prev.buf, false);
+                        try c.append(elem_slice, false);
+                        self.* = .{ .chunks = c };
+                    }
                 },
                 .packed_slice => |prev| {
-                    self.mergeUnpackedAfterPacked(msg_start, prev, tag_ptr, r.ptr, field_number);
+                    try self.mergeUnpackedAfterPacked(msg_start, prev, tag_ptr, r.ptr, field_number);
+                },
+                .chunks => |*c| {
+                    if (!try c.tryExtendLast(msg_start, tag_ptr, r.ptr)) {
+                        try c.append(elem_slice, false);
+                    }
                 },
             }
         }
@@ -924,28 +1119,26 @@ pub fn Repeated(comptime Codec: type) type {
             tag_ptr: [*]const u8,
             end_ptr: [*]const u8,
             field_number: u29,
-        ) void {
+        ) DecodeError!void {
             @branchHint(.cold);
+            const elem_slice = tag_ptr[0 .. @intFromPtr(end_ptr) - @intFromPtr(tag_ptr)];
             if (prev.data.len == 0) {
                 self.* = .{ .wire = .{
-                    .buf = tag_ptr[0 .. @intFromPtr(end_ptr) - @intFromPtr(tag_ptr)],
+                    .buf = elem_slice,
                     .field_number = field_number,
                 } };
                 return;
             }
-            const base = @intFromPtr(msg_start);
-            const p = @intFromPtr(prev.tag_ptr);
-            const t = @intFromPtr(tag_ptr);
-            if (p >= base and p <= t) {
+            if (canExtendPtr(prev.tag_ptr, msg_start, tag_ptr)) {
                 self.* = .{ .wire = .{
-                    .buf = prev.tag_ptr[0 .. @intFromPtr(end_ptr) - p],
+                    .buf = prev.tag_ptr[0 .. @intFromPtr(end_ptr) - @intFromPtr(prev.tag_ptr)],
                     .field_number = field_number,
                 } };
             } else {
-                self.* = .{ .wire = .{
-                    .buf = tag_ptr[0 .. @intFromPtr(end_ptr) - t],
-                    .field_number = field_number,
-                } };
+                var c = WireChunks.init(field_number);
+                try c.append(prev.data, true);
+                try c.append(elem_slice, false);
+                self.* = .{ .chunks = c };
             }
         }
 
@@ -979,7 +1172,7 @@ pub fn Repeated(comptime Codec: type) type {
                         return total;
                     }
                 },
-                .wire => {
+                .wire, .chunks => {
                     var it = self.iterator();
                     if (comptime (Codec.is_packable and pack)) {
                         var payload: usize = 0;
@@ -1027,7 +1220,7 @@ pub fn Repeated(comptime Codec: type) type {
                         }
                     }
                 },
-                .wire => {
+                .wire, .chunks => {
                     if (comptime (Codec.is_packable and pack)) {
                         var payload: usize = 0;
                         var size_it = self.iterator();
@@ -1083,7 +1276,7 @@ pub fn Repeated(comptime Codec: type) type {
                         try self.encode(field_number, pack, &sw);
                     }
                 },
-                .wire => {
+                .wire, .chunks => {
                     const sz = self.encodedSize(field_number, pack);
                     if (sz == 0) return;
                     const dst = try rw.reserve(sz);
@@ -1099,12 +1292,13 @@ inline fn keysEqual(comptime K: type, a: K, b: K) bool {
     return if (K == []const u8) std.mem.eql(u8, a, b) else a == b;
 }
 
-/// Zero-allocation map field backed by tight [first..last] wire windows.
+/// Zero-allocation map field backed by tight wire windows and lossless multi-chunk merging.
 pub fn Map(comptime KCodec: type, comptime VCodec: type) type {
     @setEvalBranchQuota(100_000);
     return union(enum) {
         slice: []const Entry,
         wire: WireFieldView,
+        chunks: WireChunks,
 
         pub const Entry = struct {
             key: KCodec.T,
@@ -1126,7 +1320,11 @@ pub fn Map(comptime KCodec: type, comptime VCodec: type) type {
                 if (raw_tag == key_tag) {
                     entry.key = try KCodec.read(&r, depth - 1);
                 } else if (raw_tag == val_tag) {
-                    entry.value = try VCodec.read(&r, depth - 1);
+                    if (comptime VCodec.is_message) {
+                        try VCodec.mergeRead(&entry.value, &r, depth - 1);
+                    } else {
+                        entry.value = try VCodec.read(&r, depth - 1);
+                    }
                 } else {
                     const tag = try decodeTag(raw_tag);
                     if (tag.field_number == 1 or tag.field_number == 2) return error.WireTypeMismatch;
@@ -1164,16 +1362,30 @@ pub fn Map(comptime KCodec: type, comptime VCodec: type) type {
             depth: u32,
         ) DecodeError!void {
             try validateEntry(try r.readBytes(), depth);
+            const entry_wire = tag_ptr[0 .. @intFromPtr(r.ptr) - @intFromPtr(tag_ptr)];
 
             switch (self.*) {
                 .slice => {
                     self.* = .{ .wire = .{
-                        .buf = tag_ptr[0 .. @intFromPtr(r.ptr) - @intFromPtr(tag_ptr)],
+                        .buf = entry_wire,
                         .field_number = field_number,
                     } };
                 },
                 .wire => |*prev| {
-                    prev.buf = extendWindow(prev.buf, msg_start, tag_ptr, r.ptr);
+                    if (canExtendPtr(prev.buf.ptr, msg_start, tag_ptr)) {
+                        @branchHint(.likely);
+                        prev.buf = prev.buf.ptr[0 .. @intFromPtr(r.ptr) - @intFromPtr(prev.buf.ptr)];
+                    } else {
+                        var c = WireChunks.init(field_number);
+                        try c.append(prev.buf, false);
+                        try c.append(entry_wire, false);
+                        self.* = .{ .chunks = c };
+                    }
+                },
+                .chunks => |*c| {
+                    if (!try c.tryExtendLast(msg_start, tag_ptr, r.ptr)) {
+                        try c.append(entry_wire, false);
+                    }
                 },
             }
         }
@@ -1182,6 +1394,11 @@ pub fn Map(comptime KCodec: type, comptime VCodec: type) type {
             source: union(enum) {
                 slice: struct { items: []const Entry, idx: usize = 0 },
                 wire: struct { reader: Reader, field_number: u29 },
+                chunks: struct {
+                    chunks: WireChunks,
+                    chunk_idx: usize = 0,
+                    reader: Reader = Reader.init(&.{}),
+                },
             },
 
             pub inline fn next(self: *Iterator) DecodeError!?Entry {
@@ -1204,6 +1421,25 @@ pub fn Map(comptime KCodec: type, comptime VCodec: type) type {
                         }
                         return null;
                     },
+                    .chunks => |*c| {
+                        const expected_raw: u32 = (@as(u32, c.chunks.field_number) << 3) | @backingInt(WireType.len);
+                        while (true) {
+                            if (!c.reader.eof()) {
+                                const raw_tag = (try c.reader.readRawTag()) orelse continue;
+                                if (raw_tag == expected_raw) {
+                                    return try decodeEntry(try c.reader.readBytes(), max_recursion_depth);
+                                }
+                                const tag = try decodeTag(raw_tag);
+                                if (tag.field_number == c.chunks.field_number) return error.WireTypeMismatch;
+                                try c.reader.skipField(tag, max_recursion_depth);
+                                continue;
+                            }
+                            if (c.chunk_idx >= c.chunks.len) return null;
+                            const idx = c.chunk_idx;
+                            c.chunk_idx += 1;
+                            c.reader = Reader.init(c.chunks.sliceAt(idx));
+                        }
+                    },
                 }
             }
         };
@@ -1215,7 +1451,65 @@ pub fn Map(comptime KCodec: type, comptime VCodec: type) type {
                     .reader = Reader.init(w.buf),
                     .field_number = w.field_number,
                 } } },
+                .chunks => |c| .{ .source = .{ .chunks = .{ .chunks = c } } },
             };
+        }
+
+        fn scanWindowForKey(
+            buf: []const u8,
+            field_number: u29,
+            key: KCodec.T,
+            found: *?VCodec.T,
+        ) DecodeError!void {
+            var r = Reader.init(buf);
+            const expected_raw: u32 = (@as(u32, field_number) << 3) | @backingInt(WireType.len);
+            const key_tag = comptime rawTag(1, KCodec.wire_type);
+            const val_tag = comptime rawTag(2, VCodec.wire_type);
+            while (try r.readRawTag()) |raw_tag| {
+                if (raw_tag != expected_raw) {
+                    const tag = try decodeTag(raw_tag);
+                    if (tag.field_number == field_number) return error.WireTypeMismatch;
+                    try r.skipField(tag, max_recursion_depth);
+                    continue;
+                }
+                const entry_bytes = try r.readBytes();
+                var er = Reader.init(entry_bytes);
+                var k: KCodec.T = KCodec.default_value;
+                var v: VCodec.T = VCodec.default_value;
+                var has_key = false;
+                var key_matches = false;
+                var skipped_val = false;
+                while (try er.readRawTag()) |eraw| {
+                    if (eraw == key_tag) {
+                        k = try KCodec.read(&er, max_recursion_depth - 1);
+                        has_key = true;
+                        key_matches = keysEqual(KCodec.T, k, key);
+                        if (key_matches and skipped_val) {
+                            const full = try decodeEntry(entry_bytes, max_recursion_depth);
+                            if (keysEqual(KCodec.T, full.key, key)) found.* = full.value;
+                            key_matches = false;
+                            break;
+                        }
+                    } else if (eraw == val_tag) {
+                        if (has_key and !key_matches) {
+                            try VCodec.validate(&er, max_recursion_depth - 1);
+                            skipped_val = true;
+                        } else {
+                            if (comptime VCodec.is_message) {
+                                try VCodec.mergeRead(&v, &er, max_recursion_depth - 1);
+                            } else {
+                                v = try VCodec.read(&er, max_recursion_depth - 1);
+                            }
+                        }
+                    } else {
+                        const etag = try decodeTag(eraw);
+                        if (etag.field_number == 1 or etag.field_number == 2) return error.WireTypeMismatch;
+                        try er.skipField(etag, max_recursion_depth - 1);
+                    }
+                }
+                if (!has_key) key_matches = keysEqual(KCodec.T, k, key);
+                if (key_matches) found.* = v;
+            }
         }
 
         /// Official Protobuf map semantics: last duplicate key wins.
@@ -1232,50 +1526,13 @@ pub fn Map(comptime KCodec: type, comptime VCodec: type) type {
                 },
                 .wire => |w| {
                     var found: ?VCodec.T = null;
-                    var r = Reader.init(w.buf);
-                    const expected_raw: u32 = (@as(u32, w.field_number) << 3) | @backingInt(WireType.len);
-                    const key_tag = comptime rawTag(1, KCodec.wire_type);
-                    const val_tag = comptime rawTag(2, VCodec.wire_type);
-                    while (try r.readRawTag()) |raw_tag| {
-                        if (raw_tag != expected_raw) {
-                            const tag = try decodeTag(raw_tag);
-                            if (tag.field_number == w.field_number) return error.WireTypeMismatch;
-                            try r.skipField(tag, max_recursion_depth);
-                            continue;
-                        }
-                        const entry_bytes = try r.readBytes();
-                        var er = Reader.init(entry_bytes);
-                        var k: KCodec.T = KCodec.default_value;
-                        var v: VCodec.T = VCodec.default_value;
-                        var has_key = false;
-                        var key_matches = false;
-                        var skipped_val = false;
-                        while (try er.readRawTag()) |eraw| {
-                            if (eraw == key_tag) {
-                                k = try KCodec.read(&er, max_recursion_depth - 1);
-                                has_key = true;
-                                key_matches = keysEqual(KCodec.T, k, key);
-                                if (key_matches and skipped_val) {
-                                    const full = try decodeEntry(entry_bytes, max_recursion_depth);
-                                    if (keysEqual(KCodec.T, full.key, key)) found = full.value;
-                                    key_matches = false;
-                                    break;
-                                }
-                            } else if (eraw == val_tag) {
-                                if (has_key and !key_matches) {
-                                    try VCodec.validate(&er, max_recursion_depth - 1);
-                                    skipped_val = true;
-                                } else {
-                                    v = try VCodec.read(&er, max_recursion_depth - 1);
-                                }
-                            } else {
-                                const etag = try decodeTag(eraw);
-                                if (etag.field_number == 1 or etag.field_number == 2) return error.WireTypeMismatch;
-                                try er.skipField(etag, max_recursion_depth - 1);
-                            }
-                        }
-                        if (!has_key) key_matches = keysEqual(KCodec.T, k, key);
-                        if (key_matches) found = v;
+                    try scanWindowForKey(w.buf, w.field_number, key, &found);
+                    return found;
+                },
+                .chunks => |c| {
+                    var found: ?VCodec.T = null;
+                    for (0..c.len) |i| {
+                        try scanWindowForKey(c.sliceAt(i), c.field_number, key, &found);
                     }
                     return found;
                 },
@@ -1299,7 +1556,7 @@ pub fn Map(comptime KCodec: type, comptime VCodec: type) type {
                         total += tsz + varintSize(payload) + payload;
                     }
                 },
-                .wire => {
+                .wire, .chunks => {
                     var it = self.iterator();
                     while (it.next() catch return 0) |e| {
                         const payload = entryPayloadSize(e);
@@ -1327,7 +1584,7 @@ pub fn Map(comptime KCodec: type, comptime VCodec: type) type {
                         }
                     }
                 },
-                .wire => {
+                .wire, .chunks => {
                     var it = self.iterator();
                     while (it.next() catch unreachable) |e| {
                         const payload = entryPayloadSize(e);
@@ -1366,7 +1623,7 @@ pub fn Map(comptime KCodec: type, comptime VCodec: type) type {
                         try rw.writeTag(field_number, .len);
                     }
                 },
-                .wire => {
+                .wire, .chunks => {
                     const sz = self.encodedSize(field_number);
                     if (sz == 0) return;
                     const dst = try rw.reserve(sz);

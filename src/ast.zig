@@ -7,6 +7,11 @@ pub const Option = struct {
     raw_value: []const u8,
 };
 
+pub const ReservedRange = struct {
+    start: i32,
+    end: i32,
+};
+
 pub const Field = struct {
     label: FieldLabel,
     type_name: []const u8,
@@ -36,6 +41,7 @@ pub const EnumValue = struct {
 pub const Enum = struct {
     name: []const u8,
     values: []EnumValue,
+    allow_alias: bool = false,
 };
 
 pub const Message = struct {
@@ -45,6 +51,8 @@ pub const Message = struct {
     oneofs: []Oneof,
     nested_messages: []Message,
     nested_enums: []Enum,
+    reserved_ranges: []const ReservedRange = &.{},
+    reserved_names: []const []const u8 = &.{},
 };
 
 pub const Rpc = struct {

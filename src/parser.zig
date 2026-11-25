@@ -8,29 +8,35 @@ pub const ParseError = error{
     OutOfMemory,
 };
 
+pub const max_field_number: i32 = 536_870_911;
+
 pub const Parser = struct {
     arena: std.mem.Allocator,
     lex: lexer.Lexer,
     cur: lexer.Token,
-    peek_tok: lexer.Token,
+    peek1: lexer.Token,
+    peek2: lexer.Token,
 
     pub fn parse(arena: std.mem.Allocator, src: []const u8) ParseError!ast.File {
         var lex = lexer.Lexer{ .src = src };
-        const first = lex.next();
-        const second = lex.next();
+        const t0 = lex.next();
+        const t1 = lex.next();
+        const t2 = lex.next();
         var p = Parser{
             .arena = arena,
             .lex = lex,
-            .cur = first,
-            .peek_tok = second,
+            .cur = t0,
+            .peek1 = t1,
+            .peek2 = t2,
         };
         return p.parseFile();
     }
 
     fn advance(self: *Parser) lexer.Token {
         const prev = self.cur;
-        self.cur = self.peek_tok;
-        self.peek_tok = self.lex.next();
+        self.cur = self.peek1;
+        self.peek1 = self.peek2;
+        self.peek2 = self.lex.next();
         return prev;
     }
 
@@ -43,14 +49,61 @@ pub const Parser = struct {
         return tok.kind == .ident and std.mem.eql(u8, tok.text, text);
     }
 
+    fn unescapeString(self: *Parser, raw: []const u8) ParseError![]const u8 {
+        if (std.mem.indexOfScalar(u8, raw, '\\') == null) return raw;
+        var out: std.ArrayList(u8) = .empty;
+        var i: usize = 0;
+        while (i < raw.len) {
+            const c = raw[i];
+            if (c != '\\' or i + 1 >= raw.len) {
+                try out.append(self.arena, c);
+                i += 1;
+                continue;
+            }
+            i += 1;
+            const esc = raw[i];
+            i += 1;
+            switch (esc) {
+                'a' => try out.append(self.arena, 0x07),
+                'b' => try out.append(self.arena, 0x08),
+                'f' => try out.append(self.arena, 0x0C),
+                'n' => try out.append(self.arena, '\n'),
+                'r' => try out.append(self.arena, '\r'),
+                't' => try out.append(self.arena, '\t'),
+                'v' => try out.append(self.arena, 0x0B),
+                '\\', '\'', '"', '?' => try out.append(self.arena, esc),
+                'x', 'X' => {
+                    var val: u8 = 0;
+                    var digits: usize = 0;
+                    while (digits < 2 and i < raw.len and std.ascii.isHex(raw[i])) : (digits += 1) {
+                        val = (val << 4) | (std.fmt.charToDigit(raw[i], 16) catch 0);
+                        i += 1;
+                    }
+                    try out.append(self.arena, val);
+                },
+                '0'...'7' => {
+                    var val: u16 = esc - '0';
+                    var digits: usize = 1;
+                    while (digits < 3 and i < raw.len and raw[i] >= '0' and raw[i] <= '7') : (digits += 1) {
+                        val = (val << 3) | (raw[i] - '0');
+                        i += 1;
+                    }
+                    try out.append(self.arena, @truncate(val));
+                },
+                else => try out.append(self.arena, esc),
+            }
+        }
+        return out.toOwnedSlice(self.arena);
+    }
+
     /// Parses adjacent string literals (official proto grammar allows `"a" "b"`).
     fn parseStringConcat(self: *Parser) ParseError![]const u8 {
-        const first = try self.expect(.string);
-        if (self.cur.kind != .string) return first.text;
+        const first = try self.unescapeString((try self.expect(.string)).text);
+        if (self.cur.kind != .string) return first;
         var buf: std.ArrayList(u8) = .empty;
-        try buf.appendSlice(self.arena, first.text);
+        try buf.appendSlice(self.arena, first);
         while (self.cur.kind == .string) {
-            try buf.appendSlice(self.arena, self.advance().text);
+            try buf.appendSlice(self.arena, try self.unescapeString(self.advance().text));
         }
         return try buf.toOwnedSlice(self.arena);
     }
@@ -71,6 +124,17 @@ pub const Parser = struct {
         return try buf.toOwnedSlice(self.arena);
     }
 
+    /// Parses Protobuf integer literals: decimal, `0x` hex, and C-style leading-zero octal (`0777`).
+    fn parseProtoInt(text: []const u8) ParseError!i64 {
+        if (text.len >= 2 and text[0] == '0' and (text[1] == 'x' or text[1] == 'X')) {
+            return std.fmt.parseInt(i64, text[2..], 16) catch return error.InvalidNumber;
+        }
+        if (text.len >= 2 and text[0] == '0') {
+            return std.fmt.parseInt(i64, text[1..], 8) catch return error.InvalidNumber;
+        }
+        return std.fmt.parseInt(i64, text, 10) catch return error.InvalidNumber;
+    }
+
     fn parseSignedI32(self: *Parser) ParseError!i32 {
         var neg = false;
         if (self.cur.kind == .minus) {
@@ -80,14 +144,15 @@ pub const Parser = struct {
             _ = self.advance();
         }
         const tok = try self.expect(.number);
-        const mag = std.fmt.parseInt(i64, tok.text, 0) catch return error.InvalidNumber;
+        const mag = try parseProtoInt(tok.text);
         const val = if (neg) -mag else mag;
         return std.math.cast(i32, val) orelse error.InvalidNumber;
     }
 
     fn parseFieldNumber(self: *Parser) ParseError!u29 {
         const tok = try self.expect(.number);
-        return std.fmt.parseInt(u29, tok.text, 0) catch return error.InvalidNumber;
+        const val = try parseProtoInt(tok.text);
+        return std.math.cast(u29, val) orelse error.InvalidNumber;
     }
 
     fn parseOptionName(self: *Parser) ParseError![]const u8 {
@@ -110,7 +175,7 @@ pub const Parser = struct {
         return try buf.toOwnedSlice(self.arena);
     }
 
-    /// Parses scalar or aggregate `{ ... }` option values.
+    /// Parses scalar, qualified enum/identifier (`pkg.Mode.FAST`), or aggregate `{ ... }` option values.
     fn parseOptionValue(self: *Parser) ParseError![]const u8 {
         if (self.cur.kind == .lbrace) {
             try self.skipBalanced(.lbrace, .rbrace);
@@ -119,11 +184,15 @@ pub const Parser = struct {
         if (self.cur.kind == .string) return self.parseStringConcat();
         if (self.cur.kind == .minus or self.cur.kind == .plus) {
             const sign = self.advance().text;
+            if (self.cur.kind != .number and self.cur.kind != .ident) return error.UnexpectedToken;
             const num = self.advance().text;
             return try std.mem.concat(self.arena, u8, &.{ sign, num });
         }
-        if (self.cur.kind == .ident or self.cur.kind == .number) {
+        if (self.cur.kind == .number) {
             return self.advance().text;
+        }
+        if (self.cur.kind == .ident or self.cur.kind == .dot) {
+            return self.parseQualifiedIdent();
         }
         return error.UnexpectedToken;
     }
@@ -169,6 +238,39 @@ pub const Parser = struct {
             } else {
                 _ = self.advance();
             }
+        }
+        _ = try self.expect(.semi);
+    }
+
+    fn parseMessageReserved(
+        self: *Parser,
+        ranges: *std.ArrayList(ast.ReservedRange),
+        names: *std.ArrayList([]const u8),
+    ) ParseError!void {
+        _ = self.advance(); // "reserved"
+        while (self.cur.kind != .semi and self.cur.kind != .eof) {
+            if (self.cur.kind == .string) {
+                try names.append(self.arena, try self.parseStringConcat());
+            } else if (self.cur.kind == .ident) {
+                // Editions allow bare identifier names in reserved statements.
+                try names.append(self.arena, self.advance().text);
+            } else {
+                const start = try self.parseSignedI32();
+                var end = start;
+                if (isIdent(self.cur, "to")) {
+                    _ = self.advance();
+                    if (isIdent(self.cur, "max")) {
+                        _ = self.advance();
+                        end = max_field_number;
+                    } else {
+                        end = try self.parseSignedI32();
+                    }
+                }
+                try ranges.append(self.arena, .{ .start = start, .end = end });
+            }
+            if (self.cur.kind == .comma) {
+                _ = self.advance();
+            } else break;
         }
         _ = try self.expect(.semi);
     }
@@ -253,15 +355,19 @@ pub const Parser = struct {
         const name = (try self.expect(.ident)).text;
         _ = try self.expect(.lbrace);
         var values: std.ArrayList(ast.EnumValue) = .empty;
+        var allow_alias = false;
 
         while (self.cur.kind != .rbrace and self.cur.kind != .eof) {
             if (self.cur.kind == .semi) {
                 _ = self.advance();
                 continue;
             }
-            if (isIdent(self.cur, "option") and self.peek_tok.kind != .eq) {
-                _ = try self.parseOptionStmt();
-            } else if (isIdent(self.cur, "reserved") and self.peek_tok.kind != .eq) {
+            if (isIdent(self.cur, "option") and self.peek1.kind != .eq) {
+                const opt = try self.parseOptionStmt();
+                if (std.mem.eql(u8, opt.name, "allow_alias") and std.mem.eql(u8, opt.raw_value, "true")) {
+                    allow_alias = true;
+                }
+            } else if (isIdent(self.cur, "reserved") and self.peek1.kind != .eq) {
                 try self.skipUntilSemi();
             } else {
                 const vname = (try self.expect(.ident)).text;
@@ -273,7 +379,11 @@ pub const Parser = struct {
             }
         }
         _ = try self.expect(.rbrace);
-        return .{ .name = name, .values = try values.toOwnedSlice(self.arena) };
+        return .{
+            .name = name,
+            .values = try values.toOwnedSlice(self.arena),
+            .allow_alias = allow_alias,
+        };
     }
 
     fn parseMessage(self: *Parser) ParseError!ast.Message {
@@ -285,29 +395,36 @@ pub const Parser = struct {
         var oneofs: std.ArrayList(ast.Oneof) = .empty;
         var nested_messages: std.ArrayList(ast.Message) = .empty;
         var nested_enums: std.ArrayList(ast.Enum) = .empty;
+        var reserved_ranges: std.ArrayList(ast.ReservedRange) = .empty;
+        var reserved_names: std.ArrayList([]const u8) = .empty;
 
         while (self.cur.kind != .rbrace and self.cur.kind != .eof) {
             if (self.cur.kind == .semi) {
                 _ = self.advance();
                 continue;
             }
-            if (isIdent(self.cur, "message") and self.peek_tok.kind == .ident) {
+            if (isIdent(self.cur, "message") and self.peek1.kind == .ident and self.peek2.kind == .lbrace) {
                 _ = self.advance();
                 try nested_messages.append(self.arena, try self.parseMessage());
-            } else if (isIdent(self.cur, "enum") and self.peek_tok.kind == .ident) {
+            } else if (isIdent(self.cur, "enum") and self.peek1.kind == .ident and self.peek2.kind == .lbrace) {
                 _ = self.advance();
                 try nested_enums.append(self.arena, try self.parseEnum());
-            } else if (isIdent(self.cur, "oneof") and self.peek_tok.kind == .ident) {
+            } else if (isIdent(self.cur, "oneof") and self.peek1.kind == .ident and self.peek2.kind == .lbrace) {
                 _ = self.advance();
                 try oneofs.append(self.arena, try self.parseOneof());
-            } else if (isIdent(self.cur, "map") and self.peek_tok.kind == .langle) {
+            } else if (isIdent(self.cur, "map") and self.peek1.kind == .langle) {
                 _ = self.advance();
                 try maps.append(self.arena, try self.parseMapField());
-            } else if (isIdent(self.cur, "option")) {
+            } else if (isIdent(self.cur, "option") and self.peek1.kind != .eq) {
                 _ = try self.parseOptionStmt();
-            } else if (isIdent(self.cur, "reserved") or isIdent(self.cur, "extensions")) {
+            } else if (isIdent(self.cur, "reserved") and self.peek2.kind != .eq) {
+                try self.parseMessageReserved(&reserved_ranges, &reserved_names);
+            } else if (isIdent(self.cur, "extensions") and self.peek1.kind == .number) {
                 try self.skipUntilSemi();
-            } else if (isIdent(self.cur, "extend")) {
+            } else if (isIdent(self.cur, "extend") and
+                (self.peek1.kind == .ident or self.peek1.kind == .dot) and
+                self.peek2.kind != .eq)
+            {
                 _ = self.advance();
                 _ = try self.parseQualifiedIdent();
                 try self.skipBalanced(.lbrace, .rbrace);
@@ -326,24 +443,26 @@ pub const Parser = struct {
             .oneofs = try oneofs.toOwnedSlice(self.arena),
             .nested_messages = try nested_messages.toOwnedSlice(self.arena),
             .nested_enums = try nested_enums.toOwnedSlice(self.arena),
+            .reserved_ranges = try reserved_ranges.toOwnedSlice(self.arena),
+            .reserved_names = try reserved_names.toOwnedSlice(self.arena),
         };
     }
 
     fn parseFieldOrGroup(self: *Parser) ParseError!?ast.Field {
         var label: ast.FieldLabel = .implicit;
-        if (isIdent(self.cur, "repeated")) {
+        if (isIdent(self.cur, "repeated") and self.peek1.kind != .eq) {
             label = .repeated;
             _ = self.advance();
-        } else if (isIdent(self.cur, "optional")) {
+        } else if (isIdent(self.cur, "optional") and self.peek1.kind != .eq) {
             label = .optional;
             _ = self.advance();
-        } else if (isIdent(self.cur, "required")) {
+        } else if (isIdent(self.cur, "required") and self.peek1.kind != .eq) {
             label = .required;
             _ = self.advance();
         }
 
         // Proto2 group syntax: optional group Name = 1 { ... }
-        if (isIdent(self.cur, "group") and self.peek_tok.kind == .ident) {
+        if (isIdent(self.cur, "group") and self.peek1.kind == .ident and self.peek2.kind == .eq) {
             _ = self.advance();
             _ = try self.expect(.ident);
             _ = try self.expect(.eq);
@@ -399,7 +518,7 @@ pub const Parser = struct {
                 _ = self.advance();
                 continue;
             }
-            if (isIdent(self.cur, "option")) {
+            if (isIdent(self.cur, "option") and self.peek1.kind != .eq) {
                 _ = try self.parseOptionStmt();
                 continue;
             }

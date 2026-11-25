@@ -73,6 +73,7 @@
         "build.zig.zon",
         "build_proto.zig",
         "src",
+        "bench",
         "include",
         "LICENSE",
     },

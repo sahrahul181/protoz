@@ -159,6 +159,7 @@ fn decodeFileDescriptorProto(arena: std.mem.Allocator, bytes: []const u8) !ast.F
 fn decodeEnumDescriptor(arena: std.mem.Allocator, bytes: []const u8) !ast.Enum {
     var name: []const u8 = "";
     var values: std.ArrayList(ast.EnumValue) = .empty;
+    var allow_alias = false;
 
     var r = wire.Reader.init(bytes);
     while (try r.readTag()) |tag| {
@@ -177,10 +178,24 @@ fn decodeEnumDescriptor(arena: std.mem.Allocator, bytes: []const u8) !ast.Enum {
                 }
                 try values.append(arena, .{ .name = vname, .number = vnum });
             },
+            3 => { // EnumOptions
+                var ordr = wire.Reader.init(try r.readBytes());
+                while (try ordr.readTag()) |ot| {
+                    if (ot.field_number == 2) {
+                        allow_alias = (try ordr.readVarint()) != 0;
+                    } else {
+                        try ordr.skipField(ot, wire.max_recursion_depth);
+                    }
+                }
+            },
             else => try r.skipField(tag, wire.max_recursion_depth),
         }
     }
-    return .{ .name = name, .values = try values.toOwnedSlice(arena) };
+    return .{
+        .name = name,
+        .values = try values.toOwnedSlice(arena),
+        .allow_alias = allow_alias,
+    };
 }
 
 const RawField = struct {

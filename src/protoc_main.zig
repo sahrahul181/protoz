@@ -10,16 +10,53 @@ fn parentDir(path: []const u8) ?[]const u8 {
     return null;
 }
 
-fn writeRootExportName(w: *std.Io.Writer, proto_name: []const u8) !void {
+fn makeUniqueRootExportName(
+    arena: std.mem.Allocator,
+    proto_name: []const u8,
+    used: *std.StringHashMapUnmanaged(void),
+) ![]const u8 {
     const stem = if (std.mem.endsWith(u8, proto_name, ".proto"))
         proto_name[0 .. proto_name.len - ".proto".len]
     else
         proto_name;
+
+    var buf: std.ArrayList(u8) = .empty;
+    if (stem.len == 0 or std.ascii.isDigit(stem[0])) {
+        try buf.append(arena, '_');
+    }
     for (stem) |ch| {
         if (std.ascii.isAlphanumeric(ch) or ch == '_') {
-            try w.writeByte(ch);
+            try buf.append(arena, ch);
         } else {
-            try w.writeByte('_');
+            try buf.append(arena, '_');
+        }
+    }
+
+    const base = try buf.toOwnedSlice(arena);
+    if (!used.contains(base)) {
+        try used.put(arena, base, {});
+        return base;
+    }
+
+    var suffix: usize = 2;
+    while (true) : (suffix += 1) {
+        const candidate = try std.fmt.allocPrint(arena, "{s}_{d}", .{ base, suffix });
+        if (!used.contains(candidate)) {
+            try used.put(arena, candidate, {});
+            return candidate;
+        }
+    }
+}
+
+/// Writes a path in Make depfile format (forward slashes, escaped spaces/`#`/`$`).
+fn writeDepPath(w: *std.Io.Writer, path: []const u8) !void {
+    for (path) |ch| {
+        switch (ch) {
+            '\\' => try w.writeByte('/'),
+            ' ' => try w.writeAll("\\ "),
+            '#' => try w.writeAll("\\#"),
+            '$' => try w.writeAll("$$"),
+            else => try w.writeByte(ch),
         }
     }
 }
@@ -60,7 +97,8 @@ pub fn main(init: std.process.Init) !void {
     const res = try resolver.Resolver.buildMulti(arena, ws.files);
     const cwd = std.Io.Dir.cwd();
 
-    if (out_dir) |dir_path| {
+    if (out_dir) |raw_dir_path| {
+        const dir_path = try loader.Loader.normalizePath(arena, raw_dir_path);
         try cwd.createDirPath(init.io, dir_path);
         var buf: [8192]u8 = undefined;
 
@@ -76,41 +114,48 @@ pub fn main(init: std.process.Init) !void {
             try writer.interface.flush();
         }
 
-        // Emit package root barrel so Zig's module root covers all relative cross-file @imports.
         const root_rel = root_file_name orelse "root.zig";
         const root_full = try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir_path, root_rel });
         {
             const rf = try cwd.createFile(init.io, root_full, .{});
             defer rf.close(init.io);
             var rw = rf.writerStreaming(init.io, &buf);
+            var used_exports: std.StringHashMapUnmanaged(void) = .empty;
             try rw.interface.writeAll("// Auto-generated package root by zig-protoc.\n");
             for (ws.files) |file| {
                 const rel_zig = try codegen.protoToZigRelPath(arena, file.name);
+                const export_name = try makeUniqueRootExportName(arena, file.name, &used_exports);
                 try rw.interface.writeAll("pub const ");
-                try writeRootExportName(&rw.interface, file.name);
+                try codegen.writeIdent(&rw.interface, export_name);
                 try rw.interface.print(" = @import(\"{s}\");\n", .{rel_zig});
             }
             try rw.interface.flush();
         }
 
-        // Emit Make-format depfile so `zig build` tracks all transitively imported .proto files.
         if (depfile_path) |dp| {
-            const df = try cwd.createFile(init.io, dp, .{});
+            const clean_dp = try loader.Loader.normalizePath(arena, dp);
+            if (parentDir(clean_dp)) |pdir| try cwd.createDirPath(init.io, pdir);
+            const df = try cwd.createFile(init.io, clean_dp, .{});
             defer df.close(init.io);
             var dw = df.writerStreaming(init.io, &buf);
-            try dw.interface.print("{s}:", .{root_full});
-            for (ws.disk_paths) |p| try dw.interface.print(" {s}", .{p});
-            try dw.interface.writeAll("\n");
+            try writeDepPath(&dw.interface, root_full);
+            try dw.interface.writeByte(':');
+            for (ws.disk_paths) |p| {
+                try dw.interface.writeByte(' ');
+                try writeDepPath(&dw.interface, p);
+            }
+            try dw.interface.writeByte('\n');
             try dw.interface.flush();
         }
         return;
     }
 
-    // Legacy single-file mode (last loaded file is the entry file after depth-first imports)
     const target_idx = ws.files.len - 1;
     var buf: [8192]u8 = undefined;
     if (output_path) |out_path| {
-        const out_file = try cwd.createFile(init.io, out_path, .{});
+        const clean_out = try loader.Loader.normalizePath(arena, out_path);
+        if (parentDir(clean_out)) |pdir| try cwd.createDirPath(init.io, pdir);
+        const out_file = try cwd.createFile(init.io, clean_out, .{});
         defer out_file.close(init.io);
         var writer = out_file.writerStreaming(init.io, &buf);
         try codegen.generateFile(arena, target_idx, &res, &writer.interface);
