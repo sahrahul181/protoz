@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    name: Format Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2
+      - name: Check Zig formatting
+        run: zig fmt --check build.zig build_proto.zig src bench
+
+  test:
+    name: Build & Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2
+
+      - name: Run tests (Debug)
+        run: zig build test --summary all
+
+      - name: Run tests (ReleaseSafe)
+        run: zig build test -Doptimize=ReleaseSafe --summary all
+
+      - name: Build CLI & plugin binaries (ReleaseFast)
+        run: zig build -Doptimize=ReleaseFast
+
+  bench:
+    name: Benchmark Smoke Check
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2
+
+      - name: Run ReleaseFast benchmarks
+        run: zig build bench -Doptimize=ReleaseFast

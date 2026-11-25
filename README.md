@@ -1,5 +1,5 @@
 # protoz
-
+[![CI](https://github.com/sahrahul181/protoz/actions/workflows/ci.yml/badge.svg)](https://github.com/sahrahul181/protoz/actions/workflows/ci.yml)
 A high-performance, **zero-allocation** Protocol Buffers (`proto3`, `proto2`, and `edition`) compiler and runtime written in pure Zig.
 
 ---
