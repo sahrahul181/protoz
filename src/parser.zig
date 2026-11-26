@@ -177,15 +177,23 @@ pub const Parser = struct {
             _ = self.advance();
         }
         const tok = try self.expect(.number);
-        const mag = try parseProtoInt(tok.text);
+        const mag = parseProtoInt(tok.text) catch {
+            return self.fail(tok, "invalid integer literal '{s}'", .{tok.text}, error.InvalidNumber);
+        };
         const val = if (neg) -mag else mag;
-        return std.math.cast(i32, val) orelse error.InvalidNumber;
+        return std.math.cast(i32, val) orelse {
+            return self.fail(tok, "integer literal '{s}' out of i32 range", .{tok.text}, error.InvalidNumber);
+        };
     }
 
     fn parseFieldNumber(self: *Parser) ParseError!u29 {
         const tok = try self.expect(.number);
-        const val = try parseProtoInt(tok.text);
-        return std.math.cast(u29, val) orelse error.InvalidNumber;
+        const val = parseProtoInt(tok.text) catch {
+            return self.fail(tok, "invalid field number '{s}'", .{tok.text}, error.InvalidNumber);
+        };
+        return std.math.cast(u29, val) orelse {
+            return self.fail(tok, "field number '{s}' out of range", .{tok.text}, error.InvalidNumber);
+        };
     }
 
     fn parseOptionName(self: *Parser) ParseError![]const u8 {
@@ -217,7 +225,14 @@ pub const Parser = struct {
         if (self.cur.kind == .string) return self.parseStringConcat();
         if (self.cur.kind == .minus or self.cur.kind == .plus) {
             const sign = self.advance().text;
-            if (self.cur.kind != .number and self.cur.kind != .ident) return error.UnexpectedToken;
+            if (self.cur.kind != .number and self.cur.kind != .ident) {
+                return self.fail(
+                    self.cur,
+                    "expected number or identifier after '{s}', found '{s}'",
+                    .{ sign, self.cur.text },
+                    error.UnexpectedToken,
+                );
+            }
             const num = self.advance().text;
             return try std.mem.concat(self.arena, u8, &.{ sign, num });
         }
@@ -227,17 +242,19 @@ pub const Parser = struct {
         if (self.cur.kind == .ident or self.cur.kind == .dot) {
             return self.parseQualifiedIdent();
         }
-        return error.UnexpectedToken;
+        return self.fail(self.cur, "unexpected token '{s}' in option value", .{self.cur.text}, error.UnexpectedToken);
     }
 
     fn skipBalanced(self: *Parser, open: lexer.TokenKind, close: lexer.TokenKind) ParseError!void {
-        _ = try self.expect(open);
+        const open_tok = try self.expect(open);
         var depth: usize = 1;
         while (depth > 0 and self.cur.kind != .eof) {
             const tok = self.advance();
             if (tok.kind == open) depth += 1 else if (tok.kind == close) depth -= 1;
         }
-        if (depth != 0) return error.UnexpectedToken;
+        if (depth != 0) {
+            return self.fail(open_tok, "unclosed '{s}'", .{open_tok.text}, error.UnexpectedToken);
+        }
     }
 
     fn parseFieldOptions(self: *Parser) ParseError![]ast.Option {
@@ -415,7 +432,7 @@ pub const Parser = struct {
             } else if (isIdent(self.cur, "extend")) {
                 try extensions.append(self.arena, try self.parseExtend(&messages));
             } else {
-                return error.UnexpectedToken;
+                return self.fail(self.cur, "unexpected top-level token '{s}'", .{self.cur.text}, error.UnexpectedToken);
             }
         }
 
@@ -666,7 +683,14 @@ pub const Parser = struct {
                 _ = try self.parseOptionStmt();
                 continue;
             }
-            if (!isIdent(self.cur, "rpc")) return error.UnexpectedToken;
+            if (!isIdent(self.cur, "rpc")) {
+                return self.fail(
+                    self.cur,
+                    "expected 'rpc' in service '{s}', found '{s}'",
+                    .{ name, self.cur.text },
+                    error.UnexpectedToken,
+                );
+            }
             _ = self.advance();
             const rpc_name = (try self.expect(.ident)).text;
             _ = try self.expect(.lparen);
@@ -674,7 +698,14 @@ pub const Parser = struct {
             if (req_stream) _ = self.advance();
             const req_type = try self.parseQualifiedIdent();
             _ = try self.expect(.rparen);
-            if (!isIdent(self.cur, "returns")) return error.UnexpectedToken;
+            if (!isIdent(self.cur, "returns")) {
+                return self.fail(
+                    self.cur,
+                    "expected 'returns' in rpc '{s}.{s}', found '{s}'",
+                    .{ name, rpc_name, self.cur.text },
+                    error.UnexpectedToken,
+                );
+            }
             _ = self.advance();
             _ = try self.expect(.lparen);
             const res_stream = isIdent(self.cur, "stream");

@@ -437,6 +437,36 @@ fn encodeElem(
     }
 }
 
+fn writeIntDecimal(w: anytype, val: anytype, comptime quoted: bool) wire.WriterError(@TypeOf(w))!void {
+    const info = @typeInfo(@TypeOf(val)).int;
+    var buf: [24]u8 = undefined;
+    var pos: usize = buf.len;
+    if (comptime quoted) {
+        pos -= 1;
+        buf[pos] = '"';
+    }
+    const is_neg = if (comptime info.signedness == .signed) val < 0 else false;
+    var mag: u64 = if (comptime info.signedness == .signed) @abs(val) else @as(u64, val);
+    if (mag == 0) {
+        pos -= 1;
+        buf[pos] = '0';
+    } else {
+        while (mag > 0) : (mag /= 10) {
+            pos -= 1;
+            buf[pos] = @as(u8, @intCast(mag % 10)) + '0';
+        }
+    }
+    if (is_neg) {
+        pos -= 1;
+        buf[pos] = '-';
+    }
+    if (comptime quoted) {
+        pos -= 1;
+        buf[pos] = '"';
+    }
+    try w.writeAll(buf[pos..]);
+}
+
 fn encodeEnum(val: anytype, w: anytype, opts: EncodeOptions) wire.WriterError(@TypeOf(w))!void {
     const E = @TypeOf(val);
     if (comptime isNullValueEnum(E)) {
@@ -455,9 +485,7 @@ fn encodeEnum(val: anytype, w: anytype, opts: EncodeOptions) wire.WriterError(@T
             }
         }
     }
-    var tmp: [16]u8 = undefined;
-    const text = std.fmt.bufPrint(&tmp, "{d}", .{raw}) catch unreachable;
-    try w.writeAll(text);
+    try writeIntDecimal(w, raw, false);
 }
 
 fn encodeMapKey(key: anytype, w: anytype) wire.WriterError(@TypeOf(w))!void {
@@ -465,11 +493,7 @@ fn encodeMapKey(key: anytype, w: anytype) wire.WriterError(@TypeOf(w))!void {
     switch (@typeInfo(K)) {
         .pointer => try writeJsonString(w, key),
         .bool => try w.writeAll(if (key) "\"true\"" else "\"false\""),
-        .int => {
-            var tmp: [32]u8 = undefined;
-            const text = std.fmt.bufPrint(&tmp, "\"{d}\"", .{key}) catch unreachable;
-            try w.writeAll(text);
-        },
+        .int => try writeIntDecimal(w, key, true),
         else => @compileError("unsupported ProtoJSON map key type: " ++ @typeName(K)),
     }
 }
@@ -478,17 +502,7 @@ fn encodeScalar(val: anytype, comptime is_bytes: bool, w: anytype) wire.WriterEr
     const T = @TypeOf(val);
     switch (@typeInfo(T)) {
         .bool => try w.writeAll(if (val) "true" else "false"),
-        .int => |info| {
-            var tmp: [32]u8 = undefined;
-            const text = std.fmt.bufPrint(&tmp, "{d}", .{val}) catch unreachable;
-            if (comptime info.bits >= 64) {
-                try w.writeByte('"');
-                try w.writeAll(text);
-                try w.writeByte('"');
-            } else {
-                try w.writeAll(text);
-            }
-        },
+        .int => |info| try writeIntDecimal(w, val, info.bits >= 64),
         .float => {
             if (val != val) {
                 try w.writeAll("\"NaN\"");
@@ -687,17 +701,19 @@ const JsonParser = struct {
         self.pos += 1;
         const start = self.pos;
 
-        // Fast path: scan for closing quote without escapes
+        // Fast path: scan for closing quote without escapes, tracking non-ASCII bytes
+        var hi: u8 = 0;
         while (self.pos < self.input.len) : (self.pos += 1) {
             const b = self.input[self.pos];
             if (b == '"') {
                 const slice = self.input[start..self.pos];
                 self.pos += 1;
-                if (!std.unicode.utf8ValidateSlice(slice)) return error.InvalidUtf8;
+                if ((hi & 0x80) != 0 and !std.unicode.utf8ValidateSlice(slice)) return error.InvalidUtf8;
                 return slice;
             }
             if (b == '\\') break;
             if (b < 0x20) return error.InvalidJson;
+            hi |= b;
         }
         if (self.pos >= self.input.len) return error.UnexpectedEof;
 
@@ -797,17 +813,52 @@ const JsonParser = struct {
         self.skipWs();
         if (self.pos >= self.input.len or self.input[self.pos] != '"') return error.InvalidJson;
         self.pos += 1;
+        var seg_start = self.pos;
+        var hi: u8 = 0;
         while (self.pos < self.input.len) {
             const b = self.input[self.pos];
-            self.pos += 1;
-            if (b == '"') return;
-            if (b < 0x20) return error.InvalidJson;
-            if (b == '\\') {
-                if (self.pos >= self.input.len) return error.UnexpectedEof;
-                const esc = self.input[self.pos];
+            if (b == '"') {
+                if ((hi & 0x80) != 0 and !std.unicode.utf8ValidateSlice(self.input[seg_start..self.pos])) {
+                    return error.InvalidUtf8;
+                }
                 self.pos += 1;
-                if (esc == 'u') _ = try self.parseHex4();
+                return;
             }
+            if (b < 0x20) return error.InvalidJson;
+            if (b != '\\') {
+                hi |= b;
+                self.pos += 1;
+                continue;
+            }
+            if ((hi & 0x80) != 0 and !std.unicode.utf8ValidateSlice(self.input[seg_start..self.pos])) {
+                return error.InvalidUtf8;
+            }
+            self.pos += 1;
+            if (self.pos >= self.input.len) return error.UnexpectedEof;
+            const esc = self.input[self.pos];
+            self.pos += 1;
+            switch (esc) {
+                '"', '\\', '/', 'b', 'f', 'n', 'r', 't' => {},
+                'u' => {
+                    const cp1 = try self.parseHex4();
+                    if (cp1 >= 0xD800 and cp1 <= 0xDBFF) {
+                        if (self.pos + 2 > self.input.len or
+                            self.input[self.pos] != '\\' or
+                            self.input[self.pos + 1] != 'u')
+                        {
+                            return error.InvalidEscape;
+                        }
+                        self.pos += 2;
+                        const cp2 = try self.parseHex4();
+                        if (cp2 < 0xDC00 or cp2 > 0xDFFF) return error.InvalidEscape;
+                    } else if (cp1 >= 0xDC00 and cp1 <= 0xDFFF) {
+                        return error.InvalidEscape;
+                    }
+                },
+                else => return error.InvalidEscape,
+            }
+            seg_start = self.pos;
+            hi = 0;
         }
         return error.UnexpectedEof;
     }
@@ -1091,6 +1142,47 @@ fn decodeObject(
     return decodeObjectInner(M, arena, p, opts, depth, known_types, false);
 }
 
+fn JsonFieldMap(comptime M: type) std.StaticStringMap(usize) {
+    @setEvalBranchQuota(100_000);
+    const fields = M._protoz_json_fields;
+    comptime {
+        var total: usize = 0;
+        for (fields) |meta| {
+            total += 1;
+            if (!std.mem.eql(u8, meta.json_name, meta.proto_name)) total += 1;
+        }
+        var kvs: [total]struct { []const u8, usize } = undefined;
+        var count: usize = 0;
+        for (fields, 0..) |meta, idx| {
+            var dup_json = false;
+            for (kvs[0..count]) |prev| {
+                if (std.mem.eql(u8, prev[0], meta.json_name)) {
+                    dup_json = true;
+                    break;
+                }
+            }
+            if (!dup_json) {
+                kvs[count] = .{ meta.json_name, idx };
+                count += 1;
+            }
+            if (!std.mem.eql(u8, meta.json_name, meta.proto_name)) {
+                var dup_proto = false;
+                for (kvs[0..count]) |prev| {
+                    if (std.mem.eql(u8, prev[0], meta.proto_name)) {
+                        dup_proto = true;
+                        break;
+                    }
+                }
+                if (!dup_proto) {
+                    kvs[count] = .{ meta.proto_name, idx };
+                    count += 1;
+                }
+            }
+        }
+        return std.StaticStringMap(usize).initComptime(kvs[0..count]);
+    }
+}
+
 fn decodeObjectInner(
     comptime M: type,
     arena: wire.Allocator,
@@ -1109,118 +1201,121 @@ fn decodeObjectInner(
         try p.expectByte(':');
 
         var matched = false;
-        inline for (M._protoz_json_fields) |meta| {
-            const is_match = if (comptime std.mem.eql(u8, meta.json_name, meta.proto_name))
-                std.mem.eql(u8, key, meta.json_name)
-            else
-                std.mem.eql(u8, key, meta.json_name) or std.mem.eql(u8, key, meta.proto_name);
-
-            if (is_match) {
+        if (comptime M._protoz_json_fields.len > 0) {
+            const field_map = comptime JsonFieldMap(M);
+            if (field_map.get(key)) |field_idx| {
                 matched = true;
-                switch (comptime meta.kind) {
-                    .scalar => {
-                        if (!p.consumeLiteral("null")) {
-                            const FT = @FieldType(M, meta.zig_name);
-                            const Inner = if (comptime meta.explicit_presence) @typeInfo(FT).optional.child else FT;
-                            @field(out, meta.zig_name) = try decodeScalar(Inner, meta.is_bytes, arena, p);
-                        }
-                    },
-                    .@"enum" => {
-                        const FT = @FieldType(M, meta.zig_name);
-                        const Inner = if (comptime meta.explicit_presence) @typeInfo(FT).optional.child else FT;
-                        if (p.consumeLiteral("null")) {
-                            if (comptime isNullValueEnum(Inner)) {
-                                @field(out, meta.zig_name) = @fromBackingInt(0);
-                            }
-                        } else if (try decodeEnum(Inner, arena, p, opts)) |ev| {
-                            @field(out, meta.zig_name) = ev;
-                        }
-                    },
-                    .message => {
-                        const SubM = @typeInfo(@FieldType(M, meta.zig_name)).optional.child;
-                        if (p.consumeLiteral("null")) {
-                            if (comptime @hasDecl(SubM, "proto_full_name") and std.mem.eql(u8, SubM.proto_full_name, "google.protobuf.Value")) {
-                                @field(out, meta.zig_name) = .{ .kind = .{ .null_value = @fromBackingInt(0) } };
-                            }
-                        } else {
-                            @field(out, meta.zig_name) = try decodeMessageDepth(SubM, arena, p, opts, depth - 1, known_types);
-                        }
-                    },
-                    .lazy_message => {
-                        if (!p.consumeLiteral("null")) {
-                            const LazyT = @typeInfo(@FieldType(M, meta.zig_name)).optional.child;
-                            const SubM = @typeInfo(@FieldType(LazyT, "ptr")).pointer.child;
-                            const sub = try decodeMessageDepth(SubM, arena, p, opts, depth - 1, known_types);
-                            const ptr = try arena.create(SubM);
-                            ptr.* = sub;
-                            @field(out, meta.zig_name) = .{ .ptr = ptr };
-                        }
-                    },
-                    .repeated => {
-                        if (!p.consumeLiteral("null")) {
-                            const RepT = @FieldType(M, meta.zig_name);
-                            const ElemT = @typeInfo(@FieldType(RepT, "slice")).pointer.child;
-                            try p.expectByte('[');
-                            if (p.consumeByte(']')) {
-                                @field(out, meta.zig_name) = .empty;
-                            } else {
-                                var list: std.ArrayList(ElemT) = .empty;
-                                while (true) {
-                                    if (try decodeElemOpt(ElemT, meta.elem_is_bytes, arena, p, opts, depth - 1, known_types)) |item| {
-                                        try list.append(arena, item);
+                switch (field_idx) {
+                    inline 0...(M._protoz_json_fields.len - 1) => |fi| {
+                        const meta = M._protoz_json_fields[fi];
+                        switch (comptime meta.kind) {
+                            .scalar => {
+                                if (!p.consumeLiteral("null")) {
+                                    const FT = @FieldType(M, meta.zig_name);
+                                    const Inner = if (comptime meta.explicit_presence) @typeInfo(FT).optional.child else FT;
+                                    @field(out, meta.zig_name) = try decodeScalar(Inner, meta.is_bytes, arena, p);
+                                }
+                            },
+                            .@"enum" => {
+                                const FT = @FieldType(M, meta.zig_name);
+                                const Inner = if (comptime meta.explicit_presence) @typeInfo(FT).optional.child else FT;
+                                if (p.consumeLiteral("null")) {
+                                    if (comptime isNullValueEnum(Inner)) {
+                                        @field(out, meta.zig_name) = @fromBackingInt(0);
                                     }
-                                    if (p.consumeByte(',')) continue;
-                                    try p.expectByte(']');
-                                    break;
+                                } else if (try decodeEnum(Inner, arena, p, opts)) |ev| {
+                                    @field(out, meta.zig_name) = ev;
                                 }
-                                @field(out, meta.zig_name) = .{ .slice = try list.toOwnedSlice(arena) };
-                            }
+                            },
+                            .message => {
+                                const SubM = @typeInfo(@FieldType(M, meta.zig_name)).optional.child;
+                                if (p.consumeLiteral("null")) {
+                                    if (comptime @hasDecl(SubM, "proto_full_name") and std.mem.eql(u8, SubM.proto_full_name, "google.protobuf.Value")) {
+                                        @field(out, meta.zig_name) = .{ .kind = .{ .null_value = @fromBackingInt(0) } };
+                                    }
+                                } else {
+                                    @field(out, meta.zig_name) = try decodeMessageDepth(SubM, arena, p, opts, depth - 1, known_types);
+                                }
+                            },
+                            .lazy_message => {
+                                if (!p.consumeLiteral("null")) {
+                                    const LazyT = @typeInfo(@FieldType(M, meta.zig_name)).optional.child;
+                                    const SubM = @typeInfo(@FieldType(LazyT, "ptr")).pointer.child;
+                                    const sub = try decodeMessageDepth(SubM, arena, p, opts, depth - 1, known_types);
+                                    const ptr = try arena.create(SubM);
+                                    ptr.* = sub;
+                                    @field(out, meta.zig_name) = .{ .ptr = ptr };
+                                }
+                            },
+                            .repeated => {
+                                if (!p.consumeLiteral("null")) {
+                                    const RepT = @FieldType(M, meta.zig_name);
+                                    const ElemT = @typeInfo(@FieldType(RepT, "slice")).pointer.child;
+                                    try p.expectByte('[');
+                                    if (p.consumeByte(']')) {
+                                        @field(out, meta.zig_name) = .empty;
+                                    } else {
+                                        var list: std.ArrayList(ElemT) = .empty;
+                                        while (true) {
+                                            if (try decodeElemOpt(ElemT, meta.elem_is_bytes, arena, p, opts, depth - 1, known_types)) |item| {
+                                                try list.append(arena, item);
+                                            }
+                                            if (p.consumeByte(',')) continue;
+                                            try p.expectByte(']');
+                                            break;
+                                        }
+                                        @field(out, meta.zig_name) = .{ .slice = try list.toOwnedSlice(arena) };
+                                    }
+                                }
+                            },
+                            .map => {
+                                if (!p.consumeLiteral("null")) {
+                                    const MapT = @FieldType(M, meta.zig_name);
+                                    const EntryT = @typeInfo(@FieldType(MapT, "slice")).pointer.child;
+                                    const KeyT = @FieldType(EntryT, "key");
+                                    const ValT = @FieldType(EntryT, "value");
+                                    try p.expectByte('{');
+                                    if (p.consumeByte('}')) {
+                                        @field(out, meta.zig_name) = .empty;
+                                    } else {
+                                        var list: std.ArrayList(EntryT) = .empty;
+                                        while (true) {
+                                            const raw_k = try p.parseStringSlice(arena);
+                                            try p.expectByte(':');
+                                            const mk = try decodeMapKey(KeyT, raw_k);
+                                            if (try decodeElemOpt(ValT, meta.elem_is_bytes, arena, p, opts, depth - 1, known_types)) |mv| {
+                                                try list.append(arena, .{ .key = mk, .value = mv });
+                                            }
+                                            if (p.consumeByte(',')) continue;
+                                            try p.expectByte('}');
+                                            break;
+                                        }
+                                        @field(out, meta.zig_name) = .{ .slice = try list.toOwnedSlice(arena) };
+                                    }
+                                }
+                            },
+                            .oneof => {
+                                if (!p.consumeLiteral("null")) {
+                                    if (@field(out, meta.oneof_field) != null) return error.DuplicateOneofField;
+                                    const UnionT = @typeInfo(@FieldType(M, meta.oneof_field)).optional.child;
+                                    if (comptime meta.is_lazy) {
+                                        const LazyT = @FieldType(UnionT, meta.zig_name);
+                                        const SubM = @typeInfo(@FieldType(LazyT, "ptr")).pointer.child;
+                                        const sub = try decodeMessageDepth(SubM, arena, p, opts, depth - 1, known_types);
+                                        const ptr = try arena.create(SubM);
+                                        ptr.* = sub;
+                                        @field(out, meta.oneof_field) = @unionInit(UnionT, meta.zig_name, .{ .ptr = ptr });
+                                    } else {
+                                        const PayloadT = @FieldType(UnionT, meta.zig_name);
+                                        if (try decodeElemOpt(PayloadT, meta.is_bytes, arena, p, opts, depth - 1, known_types)) |payload| {
+                                            @field(out, meta.oneof_field) = @unionInit(UnionT, meta.zig_name, payload);
+                                        }
+                                    }
+                                }
+                            },
                         }
                     },
-                    .map => {
-                        if (!p.consumeLiteral("null")) {
-                            const MapT = @FieldType(M, meta.zig_name);
-                            const EntryT = @typeInfo(@FieldType(MapT, "slice")).pointer.child;
-                            const KeyT = @FieldType(EntryT, "key");
-                            const ValT = @FieldType(EntryT, "value");
-                            try p.expectByte('{');
-                            if (p.consumeByte('}')) {
-                                @field(out, meta.zig_name) = .empty;
-                            } else {
-                                var list: std.ArrayList(EntryT) = .empty;
-                                while (true) {
-                                    const raw_k = try p.parseStringSlice(arena);
-                                    try p.expectByte(':');
-                                    const mk = try decodeMapKey(KeyT, raw_k);
-                                    const mv = (try decodeElemOpt(ValT, meta.elem_is_bytes, arena, p, opts, depth - 1, known_types)) orelse return error.InvalidJson;
-                                    try list.append(arena, .{ .key = mk, .value = mv });
-                                    if (p.consumeByte(',')) continue;
-                                    try p.expectByte('}');
-                                    break;
-                                }
-                                @field(out, meta.zig_name) = .{ .slice = try list.toOwnedSlice(arena) };
-                            }
-                        }
-                    },
-                    .oneof => {
-                        if (!p.consumeLiteral("null")) {
-                            if (@field(out, meta.oneof_field) != null) return error.DuplicateOneofField;
-                            const UnionT = @typeInfo(@FieldType(M, meta.oneof_field)).optional.child;
-                            if (comptime meta.is_lazy) {
-                                const LazyT = @FieldType(UnionT, meta.zig_name);
-                                const SubM = @typeInfo(@FieldType(LazyT, "ptr")).pointer.child;
-                                const sub = try decodeMessageDepth(SubM, arena, p, opts, depth - 1, known_types);
-                                const ptr = try arena.create(SubM);
-                                ptr.* = sub;
-                                @field(out, meta.oneof_field) = @unionInit(UnionT, meta.zig_name, .{ .ptr = ptr });
-                            } else {
-                                const PayloadT = @FieldType(UnionT, meta.zig_name);
-                                if (try decodeElemOpt(PayloadT, meta.is_bytes, arena, p, opts, depth - 1, known_types)) |payload| {
-                                    @field(out, meta.oneof_field) = @unionInit(UnionT, meta.zig_name, payload);
-                                }
-                            }
-                        }
-                    },
+                    else => unreachable,
                 }
             }
         }
@@ -1327,8 +1422,16 @@ fn decodeInt(comptime I: type, arena: wire.Allocator, p: *JsonParser) DecodeErro
     return parseIntString(I, tok);
 }
 
-fn parseIntString(comptime I: type, tok: []const u8) DecodeError!I {
+fn validateJsonNumberToken(tok: []const u8) DecodeError!void {
     if (tok.len == 0) return error.InvalidNumber;
+    if (tok[0] == ' ' or tok[0] == '\t' or tok[0] == '\r' or tok[0] == '\n') return error.InvalidNumber;
+    var sub = JsonParser{ .input = tok };
+    _ = try sub.readNumberToken();
+    if (!sub.eof()) return error.InvalidNumber;
+}
+
+fn parseIntString(comptime I: type, tok: []const u8) DecodeError!I {
+    try validateJsonNumberToken(tok);
     if (std.mem.indexOfAny(u8, tok, ".eE") != null) {
         const f = std.fmt.parseFloat(f64, tok) catch return error.InvalidNumber;
         if (f != f or f == std.math.inf(f64) or f == -std.math.inf(f64)) return error.InvalidNumber;
@@ -1356,6 +1459,7 @@ fn decodeFloat(comptime F: type, arena: wire.Allocator, p: *JsonParser) DecodeEr
         if (std.mem.eql(u8, s, "NaN")) return std.math.nan(F);
         if (std.mem.eql(u8, s, "Infinity")) return std.math.inf(F);
         if (std.mem.eql(u8, s, "-Infinity")) return -std.math.inf(F);
+        try validateJsonNumberToken(s);
         const f = std.fmt.parseFloat(F, s) catch return error.InvalidNumber;
         if (f != f or f == std.math.inf(F) or f == -std.math.inf(F)) return error.NumberOutOfRange;
         return f;
@@ -1383,10 +1487,12 @@ fn b64Val(ch: u8) ?u8 {
 
 /// Decodes standard or URL-safe Base64 (padded or unpadded) per ProtoJSON spec.
 fn decodeBase64(arena: wire.Allocator, input: []const u8) DecodeError![]const u8 {
-    var trimmed = input;
-    while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '=') {
-        trimmed = trimmed[0 .. trimmed.len - 1];
+    var pad: usize = 0;
+    while (pad < input.len and input[input.len - 1 - pad] == '=') : (pad += 1) {
+        if (pad == 2) return error.InvalidBase64;
     }
+    if (pad > 0 and (input.len % 4) != 0) return error.InvalidBase64;
+    const trimmed = input[0 .. input.len - pad];
     if (trimmed.len == 0) return "";
     const rem = trimmed.len % 4;
     if (rem == 1) return error.InvalidBase64;

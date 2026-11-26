@@ -123,6 +123,9 @@ pub const Resolver = struct {
         e: *const ast.Enum,
     ) !void {
         const fqn = try self.joinDot(proto_scope, e.name);
+        if (self.symbols.contains(fqn)) {
+            return self.fail(self.files[file_idx].name, "duplicate symbol '{s}'", .{fqn}, error.DuplicateSymbol);
+        }
         const zig_path = try self.joinDot(zig_scope, e.name);
         try self.symbols.put(self.arena, fqn, .{
             .kind = .@"enum",
@@ -140,6 +143,9 @@ pub const Resolver = struct {
         m: *const ast.Message,
     ) !void {
         const fqn = try self.joinDot(proto_scope, m.name);
+        if (self.symbols.contains(fqn)) {
+            return self.fail(self.files[file_idx].name, "duplicate symbol '{s}'", .{fqn}, error.DuplicateSymbol);
+        }
         const zig_path = try self.joinDot(zig_scope, m.name);
         try self.symbols.put(self.arena, fqn, .{
             .kind = .message,
@@ -152,7 +158,12 @@ pub const Resolver = struct {
         for (m.nested_messages) |*nm| try self.registerMessage(file_idx, fqn, zig_path, nm);
     }
 
+    const ExtNumberTable = std.StringHashMapUnmanaged(std.AutoHashMapUnmanaged(u29, void));
+
     pub fn validate(self: *const Resolver) !void {
+        var seen_services: std.StringHashMapUnmanaged(void) = .empty;
+        var used_ext_nums: ExtNumberTable = .empty;
+
         for (self.files) |file| {
             const pkg_prefix = file.package orelse "";
             for (file.enums) |e| try self.validateEnum(file.name, file.syntax, e);
@@ -161,15 +172,29 @@ pub const Resolver = struct {
                     m.name
                 else
                     try std.fmt.allocPrint(self.arena, "{s}.{s}", .{ pkg_prefix, m.name });
-                try self.validateMessage(file.name, file.syntax, m, fqn);
+                try self.validateMessage(file.name, file.syntax, m, fqn, &used_ext_nums);
             }
             for (file.services) |svc| {
+                const svc_fqn = if (pkg_prefix.len == 0)
+                    svc.name
+                else
+                    try std.fmt.allocPrint(self.arena, "{s}.{s}", .{ pkg_prefix, svc.name });
+                if (self.symbols.contains(svc_fqn) or seen_services.contains(svc_fqn)) {
+                    return self.fail(file.name, "duplicate symbol '{s}'", .{svc_fqn}, error.DuplicateSymbol);
+                }
+                try seen_services.put(self.arena, svc_fqn, {});
+
+                var seen_rpcs: std.StringHashMapUnmanaged(void) = .empty;
                 for (svc.rpcs) |rpc| {
+                    if (seen_rpcs.contains(rpc.name)) {
+                        return self.fail(file.name, "duplicate rpc '{s}' in service '{s}'", .{ rpc.name, svc.name }, error.DuplicateRpcName);
+                    }
+                    try seen_rpcs.put(self.arena, rpc.name, {});
                     try self.validateRpcEndpointType(file.name, pkg_prefix, svc.name, rpc.name, "request", rpc.req_type);
                     try self.validateRpcEndpointType(file.name, pkg_prefix, svc.name, rpc.name, "response", rpc.res_type);
                 }
             }
-            try self.validateExtensions(file.name, pkg_prefix, file.extensions);
+            try self.validateExtensions(file.name, pkg_prefix, file.extensions, &used_ext_nums);
         }
     }
 
@@ -193,6 +218,13 @@ pub const Resolver = struct {
     fn validateEnum(self: *const Resolver, file_name: []const u8, syntax: ast.Syntax, e: ast.Enum) !void {
         if (syntax == .proto3 and (e.values.len == 0 or e.values[0].number != 0)) {
             return self.fail(file_name, "proto3 enum '{s}' must have 0 as its first value", .{e.name}, error.Proto3EnumRequiresZeroFirst);
+        }
+        var seen_names: std.StringHashMapUnmanaged(void) = .empty;
+        for (e.values) |v| {
+            if (seen_names.contains(v.name)) {
+                return self.fail(file_name, "duplicate enum value name '{s}' in '{s}'", .{ v.name, e.name }, error.DuplicateEnumValueName);
+            }
+            try seen_names.put(self.arena, v.name, {});
         }
         if (!e.allow_alias) {
             var seen: std.AutoHashMapUnmanaged(i32, void) = .empty;
@@ -244,11 +276,18 @@ pub const Resolver = struct {
         try used_names.put(self.arena, name, {});
     }
 
-    fn validateMessage(self: *const Resolver, file_name: []const u8, syntax: ast.Syntax, m: ast.Message, scope_fqn: []const u8) !void {
+    fn validateMessage(
+        self: *const Resolver,
+        file_name: []const u8,
+        syntax: ast.Syntax,
+        m: ast.Message,
+        scope_fqn: []const u8,
+        used_ext_nums: *ExtNumberTable,
+    ) !void {
         for (m.nested_enums) |ne| try self.validateEnum(file_name, syntax, ne);
         for (m.nested_messages) |nm| {
             const child_fqn = try std.fmt.allocPrint(self.arena, "{s}.{s}", .{ scope_fqn, nm.name });
-            try self.validateMessage(file_name, syntax, nm, child_fqn);
+            try self.validateMessage(file_name, syntax, nm, child_fqn, used_ext_nums);
         }
 
         var used_numbers: std.AutoHashMapUnmanaged(u29, void) = .empty;
@@ -281,7 +320,7 @@ pub const Resolver = struct {
                 };
             }
         }
-        try self.validateExtensions(file_name, scope_fqn, m.extensions);
+        try self.validateExtensions(file_name, scope_fqn, m.extensions, used_ext_nums);
     }
 
     fn validateExtensions(
@@ -289,6 +328,7 @@ pub const Resolver = struct {
         file_name: []const u8,
         scope_fqn: []const u8,
         extensions: []const ast.ExtensionDecl,
+        used_ext_nums: *ExtNumberTable,
     ) !void {
         for (extensions) |ext| {
             const rt = self.resolveType(scope_fqn, ext.extendee) catch |err| {
@@ -318,6 +358,17 @@ pub const Resolver = struct {
                         return self.fail(file_name, "extension '{s}' number {d} is outside extension ranges of '{s}'", .{ f.name, f.number, rt.message.proto_fqn }, error.ExtensionNumberOutOfRange);
                     }
                 }
+                const gop = try used_ext_nums.getOrPut(self.arena, rt.message.proto_fqn);
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                if (gop.value_ptr.contains(f.number)) {
+                    return self.fail(
+                        file_name,
+                        "duplicate extension field number {d} on '{s}'",
+                        .{ f.number, rt.message.proto_fqn },
+                        error.DuplicateExtensionNumber,
+                    );
+                }
+                try gop.value_ptr.put(self.arena, f.number, {});
                 _ = self.resolveType(scope_fqn, f.type_name) catch |err| {
                     return self.fail(file_name, "unknown type '{s}' on extension '{s}'", .{ f.type_name, f.name }, err);
                 };

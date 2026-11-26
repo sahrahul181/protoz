@@ -1842,3 +1842,96 @@ test "edition 2023: DELIMITED message encoding, LEGACY_REQUIRED, and plugin Feat
     try std.testing.expect(std.mem.indexOf(u8, plugin_gen, "try wire.writeTag(w, 1, .sgroup);") != null);
     try std.testing.expect(std.mem.indexOf(u8, plugin_gen, "items: wire.Repeated(wire.GroupCodec(Child, 2)) = .empty,") != null);
 }
+
+test "json: rejects Zig-only numeric syntax, bad base64 padding, and invalid skipped escapes" {
+    try std.testing.expectError(
+        error.InvalidNumber,
+        pb.SmallEvent.decodeJson(std.testing.failing_allocator, "{\"id\":\"1_000\"}", .{}),
+    );
+    try std.testing.expectError(
+        error.InvalidNumber,
+        pb.SmallEvent.decodeJson(std.testing.failing_allocator, "{\"id\":\"+42\"}", .{}),
+    );
+    try std.testing.expectError(
+        error.InvalidNumber,
+        pb.TelemetryBatch.Point.decodeJson(std.testing.failing_allocator, "{\"value\":\"nan\"}", .{}),
+    );
+    try std.testing.expectError(
+        error.InvalidNumber,
+        pb.TelemetryBatch.Point.decodeJson(std.testing.failing_allocator, "{\"value\":\"0x1p4\"}", .{}),
+    );
+    try std.testing.expectError(
+        error.InvalidEscape,
+        pb.SmallEvent.decodeJson(std.testing.failing_allocator, "{\"unknown\":\"\\q\"}", .{ .ignore_unknown_fields = true }),
+    );
+
+    const MockBytes = struct {
+        pub const proto_full_name: []const u8 = "google.protobuf.BytesValue";
+        pub const _protoz_json_fields: []const wire.json.JsonFieldMeta = &.{};
+        value: []const u8 = "",
+    };
+    try std.testing.expectError(
+        error.InvalidBase64,
+        wire.json.decodeMessage(MockBytes, std.testing.allocator, "\"AAAA====\"", .{}),
+    );
+    try std.testing.expectError(
+        error.InvalidBase64,
+        wire.json.decodeMessage(MockBytes, std.testing.allocator, "\"YQ=\"", .{}),
+    );
+}
+
+test "wire: mergeDepth rejects overwriting non-empty owned Repeated/Map/Lazy views" {
+    var msg = pb.UserProfile{
+        .scores = .{ .slice = &.{ 1, 2, 3 } },
+    };
+    var wire_buf: [64]u8 = undefined;
+    const encoded = try (pb.UserProfile{ .scores = .{ .slice = &.{4} } }).encodeSlice(&wire_buf);
+    try std.testing.expectError(
+        error.CannotMergeOwnedContainer,
+        msg.mergeDepth(encoded, wire.max_recursion_depth),
+    );
+}
+
+test "parser + resolver: diagnostic line/col and duplicate symbol/enum/rpc/extension checks" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Parser populates Diagnostic on top-level & service syntax errors
+    var diag: diag_mod.Diagnostic = .{};
+    try std.testing.expectError(
+        error.UnexpectedToken,
+        parser.Parser.parseWithDiag(arena, "bad.proto", "syntax = \"proto3\";\nbogus_top_level;\n", &diag),
+    );
+    try std.testing.expectEqualStrings("bad.proto", diag.file);
+    try std.testing.expectEqual(@as(u32, 2), diag.line);
+    try std.testing.expect(diag.message.len > 0);
+
+    // Duplicate message symbol
+    const dup_msg = try parser.Parser.parse(arena, "syntax = \"proto3\"; message A {} message A {}");
+    try std.testing.expectError(error.DuplicateSymbol, resolver.Resolver.build(arena, &dup_msg));
+
+    // Duplicate enum value name (even with allow_alias = true)
+    const dup_enum = try parser.Parser.parse(arena,
+        \\syntax = "proto3";
+        \\enum E { option allow_alias = true; A = 0; A = 0; }
+    );
+    try std.testing.expectError(error.DuplicateEnumValueName, resolver.Resolver.build(arena, &dup_enum));
+
+    // Duplicate RPC name in service
+    const dup_rpc = try parser.Parser.parse(arena,
+        \\syntax = "proto3";
+        \\message Req {}
+        \\service S { rpc Ping (Req) returns (Req); rpc Ping (Req) returns (Req); }
+    );
+    try std.testing.expectError(error.DuplicateRpcName, resolver.Resolver.build(arena, &dup_rpc));
+
+    // Duplicate extension field number across two extend blocks
+    const dup_ext = try parser.Parser.parse(arena,
+        \\syntax = "proto2";
+        \\message Host { extensions 100 to 199; }
+        \\extend Host { optional int32 a = 100; }
+        \\extend Host { optional string b = 100; }
+    );
+    try std.testing.expectError(error.DuplicateExtensionNumber, resolver.Resolver.build(arena, &dup_ext));
+}

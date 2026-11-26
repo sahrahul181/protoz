@@ -273,27 +273,36 @@ const GenCtx = struct {
 
 fn isReservedMessageDecl(name: []const u8) bool {
     const reserved = std.StaticStringMap(void).initComptime(.{
-        .{ "encodedSize", {} },          .{ "encode", {} },
-        .{ "encodeReverse", {} },        .{ "encodeSlice", {} },
-        .{ "validateDepth", {} },        .{ "decode", {} },
-        .{ "decodeDepth", {} },          .{ "decodeOnly", {} },
-        .{ "mergeDepth", {} },           .{ "mergeOnlyDepth", {} },
-        .{ "format", {} },               .{ "cloneInto", {} },
-        .{ "cloneOwned", {} },           .{ "encodeJson", {} },
-        .{ "encodeJsonSlice", {} },      .{ "decodeJson", {} },
-        .{ "fieldIterator", {} },        .{ "FieldIterator", {} },
-        .{ "WireFieldIterator", {} },    .{ "proto_full_name", {} },
-        .{ "defaults", {} },             .{ "isInitialized", {} },
-        .{ "_protozSkipOrReject", {} },  .{ "_protoz_json_fields", {} },
-        .{ "_protoz_known_fields", {} },
+        .{ "encodedSize", {} },         .{ "encode", {} },
+        .{ "encodeReverse", {} },       .{ "encodeSlice", {} },
+        .{ "validateDepth", {} },       .{ "decode", {} },
+        .{ "decodeDepth", {} },         .{ "decodeOnly", {} },
+        .{ "mergeDepth", {} },          .{ "mergeOnlyDepth", {} },
+        .{ "format", {} },              .{ "cloneInto", {} },
+        .{ "cloneOwned", {} },          .{ "encodeJson", {} },
+        .{ "encodeJsonSlice", {} },     .{ "decodeJson", {} },
+        .{ "fieldIterator", {} },       .{ "FieldIterator", {} },
+        .{ "WireFieldIterator", {} },   .{ "proto_full_name", {} },
+        .{ "defaults", {} },            .{ "isInitialized", {} },
+        .{ "isInitializedDepth", {} },  .{ "_protozSkipOrReject", {} },
+        .{ "_protoz_json_fields", {} }, .{ "_protoz_known_fields", {} },
     });
     return reserved.has(name);
 }
 
-fn collidesWithMessageMember(m: ast.Message, candidate: []const u8, self_proto_name: []const u8) bool {
+fn collidesWithMessageMember(
+    arena: std.mem.Allocator,
+    m: ast.Message,
+    candidate: []const u8,
+    self_proto_name: []const u8,
+) !bool {
     if (isReservedMessageDecl(candidate)) return true;
     for (m.nested_messages) |nm| if (std.mem.eql(u8, nm.name, candidate)) return true;
     for (m.nested_enums) |ne| if (std.mem.eql(u8, ne.name, candidate)) return true;
+    for (m.oneofs) |o| {
+        const otype = try oneofZigTypeName(arena, m, o.name);
+        if (std.mem.eql(u8, otype, candidate)) return true;
+    }
     if (!std.mem.eql(u8, candidate, self_proto_name)) {
         for (m.fields) |f| if (std.mem.eql(u8, f.name, candidate)) return true;
         for (m.maps) |mp| if (std.mem.eql(u8, mp.name, candidate)) return true;
@@ -306,7 +315,7 @@ fn collidesWithMessageMember(m: ast.Message, candidate: []const u8, self_proto_n
 /// while preserving the original `.proto` name for ProtoJSON and diagnostics.
 fn zigFieldName(arena: std.mem.Allocator, m: ast.Message, proto_name: []const u8) ![]const u8 {
     var candidate = proto_name;
-    while (collidesWithMessageMember(m, candidate, proto_name)) {
+    while (try collidesWithMessageMember(arena, m, candidate, proto_name)) {
         candidate = try std.fmt.allocPrint(arena, "{s}_", .{candidate});
     }
     return candidate;
@@ -921,6 +930,18 @@ fn emitMessage(parent_ctx: GenCtx, m: ast.Message, scope_fqn: []const u8, indent
             break;
         }
     }
+    if (!has_defaults) {
+        outer_def: for (m.oneofs) |o| {
+            for (o.fields) |f| {
+                const rt = try ctx.res.resolveType(scope_fqn, f.type_name);
+                if (rt == .message) continue;
+                if (findDefaultOption(f.options) != null) {
+                    has_defaults = true;
+                    break :outer_def;
+                }
+            }
+        }
+    }
     if (has_defaults) {
         try writeIndent(w, indent + 1);
         try w.writeAll("pub const defaults = struct {\n");
@@ -929,18 +950,15 @@ fn emitMessage(parent_ctx: GenCtx, m: ast.Message, scope_fqn: []const u8, indent
             const rt = try ctx.res.resolveType(scope_fqn, f.type_name);
             if (rt == .message) continue;
             const raw_def = findDefaultOption(f.options) orelse continue;
-            try writeIndent(w, indent + 2);
-            try w.writeAll("pub const ");
-            try writeIdent(w, f.name);
-            try w.writeAll(": ");
-            switch (rt) {
-                .scalar => |s| try w.writeAll(s.zig_type),
-                .@"enum" => |e| try ctx.writeSymPath(w, e),
-                .message => unreachable,
+            try emitDefaultConst(ctx, f.name, rt, raw_def, indent + 2, w);
+        }
+        for (m.oneofs) |o| {
+            for (o.fields) |f| {
+                const rt = try ctx.res.resolveType(scope_fqn, f.type_name);
+                if (rt == .message) continue;
+                const raw_def = findDefaultOption(f.options) orelse continue;
+                try emitDefaultConst(ctx, f.name, rt, raw_def, indent + 2, w);
             }
-            try w.writeAll(" = ");
-            try writeDefaultValueExpr(ctx, w, rt, raw_def);
-            try w.writeAll(";\n");
         }
         try writeIndent(w, indent + 1);
         try w.writeAll("};\n\n");
@@ -2363,11 +2381,15 @@ fn emitFieldDecode(ctx: GenCtx, m: ast.Message, f: ast.Field, rt: resolver.Resol
             try writeIndent(w, indent + 2);
             try w.writeAll("} else {\n");
             try writeIndent(w, indent + 3);
+            try w.writeAll("var sub: ");
+            try ctx.writeSymPath(w, rt.message);
+            try w.writeAll(" = .{};\n");
+            try writeIndent(w, indent + 3);
+            try w.writeAll("try sub.mergeDepth(sub_bytes, next_depth);\n");
+            try writeIndent(w, indent + 3);
             try w.writeAll("self.");
             try writeIdent(w, zname);
-            try w.writeAll(" = try ");
-            try ctx.writeSymPath(w, rt.message);
-            try w.writeAll(".decodeDepth(sub_bytes, next_depth);\n");
+            try w.writeAll(" = sub;\n");
             try writeIndent(w, indent + 2);
             try w.writeAll("}\n");
         }
@@ -2622,13 +2644,17 @@ fn emitOneofDecode(ctx: GenCtx, m: ast.Message, o: ast.Oneof, scope_fqn: []const
                 try writeIndent(w, indent + 2);
                 try w.writeAll("} else {\n");
                 try writeIndent(w, indent + 3);
+                try w.writeAll("var sub: ");
+                try ctx.writeSymPath(w, rt.message);
+                try w.writeAll(" = .{};\n");
+                try writeIndent(w, indent + 3);
+                try w.writeAll("try sub.mergeDepth(sub_bytes, next_depth);\n");
+                try writeIndent(w, indent + 3);
                 try w.writeAll("self.");
                 try writeIdent(w, o_zname);
                 try w.writeAll(" = .{ .");
                 try writeIdent(w, f.name);
-                try w.writeAll(" = try ");
-                try ctx.writeSymPath(w, rt.message);
-                try w.writeAll(".decodeDepth(sub_bytes, next_depth) };\n");
+                try w.writeAll(" = sub };\n");
                 try writeIndent(w, indent + 2);
                 try w.writeAll("}\n");
             }
@@ -2669,6 +2695,56 @@ fn emitOneofDecode(ctx: GenCtx, m: ast.Message, o: ast.Oneof, scope_fqn: []const
     }
 }
 
+fn emitDefaultConst(
+    ctx: GenCtx,
+    name: []const u8,
+    rt: resolver.ResolvedType,
+    raw_def: []const u8,
+    indent: usize,
+    w: *std.Io.Writer,
+) !void {
+    try writeIndent(w, indent);
+    try w.writeAll("pub const ");
+    try writeIdent(w, name);
+    try w.writeAll(": ");
+    switch (rt) {
+        .scalar => |s| try w.writeAll(s.zig_type),
+        .@"enum" => |e| try ctx.writeSymPath(w, e),
+        .message => unreachable,
+    }
+    try w.writeAll(" = ");
+    try writeDefaultValueExpr(ctx, w, rt, raw_def);
+    try w.writeAll(";\n");
+}
+
+fn isReservedServiceDecl(name: []const u8) bool {
+    const reserved = std.StaticStringMap(void).initComptime(.{
+        .{ "proto_full_name", {} },
+        .{ "MethodId", {} },
+        .{ "methods", {} },
+        .{ "method_infos", {} },
+        .{ "matchPath", {} },
+    });
+    return reserved.has(name);
+}
+
+fn rpcDeclName(arena: std.mem.Allocator, svc: ast.Service, rpc_name: []const u8) ![]const u8 {
+    var candidate = rpc_name;
+    while (true) {
+        var clash = isReservedServiceDecl(candidate);
+        if (!clash and !std.mem.eql(u8, candidate, rpc_name)) {
+            for (svc.rpcs) |other| {
+                if (std.mem.eql(u8, other.name, candidate)) {
+                    clash = true;
+                    break;
+                }
+            }
+        }
+        if (!clash) return candidate;
+        candidate = try std.fmt.allocPrint(arena, "{s}_", .{candidate});
+    }
+}
+
 fn writeRpcZigName(w: *std.Io.Writer, rpc_name: []const u8) !void {
     if (rpc_name.len == 0) return;
     try w.writeByte(std.ascii.toLower(rpc_name[0]));
@@ -2706,8 +2782,9 @@ fn emitService(
         const res_rt = try ctx.res.resolveType(pkg_scope, rpc.res_type);
         if (res_rt != .message) return error.RpcTypeMustBeMessage;
 
+        const rdecl = try rpcDeclName(ctx.arena, svc, rpc.name);
         try w.writeAll("    pub const ");
-        try writeIdent(w, rpc.name);
+        try writeIdent(w, rdecl);
         try w.writeAll(" = struct {\n");
         try w.print("        pub const name: []const u8 = \"{s}\";\n", .{rpc.name});
         try w.writeAll("        pub const zig_name: []const u8 = \"");
@@ -2736,8 +2813,9 @@ fn emitService(
 
     try w.writeAll("    pub const methods = .{\n");
     for (svc.rpcs) |rpc| {
+        const rdecl = try rpcDeclName(ctx.arena, svc, rpc.name);
         try w.writeAll("        ");
-        try writeIdent(w, rpc.name);
+        try writeIdent(w, rdecl);
         try w.writeAll(",\n");
     }
     try w.writeAll("    };\n\n");

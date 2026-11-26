@@ -51,6 +51,7 @@ pub const DecodeError = error{
     InvalidUtf8,
     MergeChunkLimitExceeded,
     MissingRequiredField,
+    CannotMergeOwnedContainer,
 };
 
 pub inline fn rawTag(comptime field_number: u29, comptime wt: WireType) u32 {
@@ -455,7 +456,7 @@ pub const Reader = struct {
     /// Fast comptime-specialized skip used by `decodeOnly` for unselected fields.
     pub inline fn skipWireType(self: *Reader, comptime wt: WireType) DecodeError!void {
         switch (wt) {
-            .varint => _ = try self.readVarint(),
+            .varint => try self.skipVarint(),
             .i64 => {
                 if (self.remaining() < 8) return error.UnexpectedEof;
                 self.ptr += 8;
@@ -891,9 +892,7 @@ pub fn Lazy(comptime M: type) type {
                     } };
                 },
                 .pair => return error.MergeChunkLimitExceeded,
-                .ptr => {
-                    self.* = .{ .raw_wire = .{ .data = sub_bytes, .tag_ptr = tag_ptr } };
-                },
+                .ptr => return error.CannotMergeOwnedContainer,
             }
         }
 
@@ -1158,6 +1157,10 @@ pub fn Repeated(comptime Codec: type) type {
             try validatePacked(payload);
             if (self.* == .slice) {
                 @branchHint(.likely);
+                if (self.slice.len != 0) {
+                    @branchHint(.unlikely);
+                    return error.CannotMergeOwnedContainer;
+                }
                 self.* = .{ .packed_slice = .{ .data = payload, .tag_ptr = tag_ptr } };
                 return;
             }
@@ -1220,7 +1223,8 @@ pub fn Repeated(comptime Codec: type) type {
             try Codec.validate(r, depth);
             const elem_slice = tag_ptr[0 .. @intFromPtr(r.ptr) - @intFromPtr(tag_ptr)];
             switch (self.*) {
-                .slice => {
+                .slice => |s| {
+                    if (s.len != 0) return error.CannotMergeOwnedContainer;
                     self.* = .{ .wire = .{
                         .buf = elem_slice,
                         .field_number = field_number,
@@ -1413,11 +1417,24 @@ pub fn Repeated(comptime Codec: type) type {
                     }
                 },
                 .wire, .chunks => {
-                    const sz = self.encodedSize(field_number, pack);
-                    if (sz == 0) return;
-                    const dst = try rw.reserve(sz);
-                    var sw = SliceWriter.init(dst);
-                    try self.encode(field_number, pack, &sw);
+                    if (comptime (Codec.is_packable and pack)) {
+                        var payload: usize = 0;
+                        var size_it = self.iterator();
+                        while (size_it.next() catch unreachable) |v| payload += Codec.size(v);
+                        if (payload == 0) return;
+                        const dst = try rw.reserve(payload);
+                        var sw = SliceWriter.init(dst);
+                        var write_it = self.iterator();
+                        while (write_it.next() catch unreachable) |v| Codec.write(&sw, v) catch unreachable;
+                        try rw.writeVarint(payload);
+                        try rw.writeTag(field_number, .len);
+                    } else {
+                        const sz = self.encodedSize(field_number, pack);
+                        if (sz == 0) return;
+                        const dst = try rw.reserve(sz);
+                        var sw = SliceWriter.init(dst);
+                        try self.encode(field_number, pack, &sw);
+                    }
                 },
             }
         }
@@ -1467,6 +1484,10 @@ pub fn Map(comptime KCodec: type, comptime VCodec: type) type {
                     else => try r.skipField(tag, depth),
                 }
             }
+            if (comptime @typeInfo(Val) == .@"struct" and @hasDecl(Val, "isInitializedDepth")) {
+                if (depth == 0) return error.RecursionLimitExceeded;
+                if (!value.isInitializedDepth(depth - 1)) return error.MissingRequiredField;
+            }
             return .{ .key = key, .value = value };
         }
 
@@ -1501,7 +1522,8 @@ pub fn Map(comptime KCodec: type, comptime VCodec: type) type {
             const entry_wire = tag_ptr[0 .. @intFromPtr(r.ptr) - @intFromPtr(tag_ptr)];
 
             switch (self.*) {
-                .slice => {
+                .slice => |s| {
+                    if (s.len != 0) return error.CannotMergeOwnedContainer;
                     self.* = .{ .wire = .{
                         .buf = entry_wire,
                         .field_number = field_number,
@@ -1628,7 +1650,7 @@ pub fn Map(comptime KCodec: type, comptime VCodec: type) type {
                         }
                     } else if (eraw == val_tag) {
                         if (has_key and !key_matches) {
-                            try VCodec.validate(&er, max_recursion_depth - 1);
+                            try er.skipWireType(VCodec.wire_type);
                             skipped_val = true;
                         } else {
                             if (comptime VCodec.is_message) {
@@ -2210,8 +2232,27 @@ pub const UnknownFields = union(enum) {
 
     inline fn isKnownField(comptime known_fields: []const u29, field_number: u29) bool {
         if (comptime known_fields.len == 0) return false;
+        const low_mask: u64 = comptime blk: {
+            var m: u64 = 0;
+            for (known_fields) |kf| {
+                if (kf < 64) m |= @as(u64, 1) << @intCast(kf);
+            }
+            break :blk m;
+        };
+        const has_high: bool = comptime blk: {
+            for (known_fields) |kf| {
+                if (kf >= 64) break :blk true;
+            }
+            break :blk false;
+        };
+        if (field_number < 64) {
+            return (low_mask & (@as(u64, 1) << @intCast(field_number))) != 0;
+        }
+        if (comptime !has_high) return false;
         inline for (known_fields) |kf| {
-            if (field_number == kf) return true;
+            if (comptime kf >= 64) {
+                if (field_number == kf) return true;
+            }
         }
         return false;
     }
