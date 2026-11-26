@@ -25,7 +25,7 @@ Requires **Zig 0.17.1+**.
 Add `protoz` to your project with `zig fetch`:
 
 ```sh
-zig fetch --save git+https://github.com/sahrahul181/protoz#v0.1.0
+zig fetch --save git+https://github.com/sahrahul181/protoz#v0.1.1
 ```
 
 Wire schema compilation in your `build.zig`:
@@ -50,6 +50,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         // .preserve_unknown_fields = true, // opt-in proxy pass-through
+        // .minimal = true,                 // omit optional JSON/iterator/helper/validate families
+        // .only_roots = &.{"api.Request"}, // prune unreachable declarations
     });
 
     const exe = b.addExecutable(.{
@@ -95,7 +97,7 @@ protoc --plugin=protoc-gen-zig=./zig-out/bin/protoc-gen-zig \
   -I proto -I include proto/api.proto
 ```
 
-Standalone `zig-protoc` also supports `--out <file>`, `--out-dir <dir>`, `--root-file <name>`, `--depfile <file>`, `-I <dir>`, and `--preserve-unknown-fields`:
+Standalone `zig-protoc` also supports `--out <file>`, `--out-dir <dir>`, `--root-file <name>`, `--depfile <file>`, `-I <dir>`, `--preserve-unknown-fields`, `--minimal` (plus `--no-*`/`--emit-*` toggles), and `--only`:
 
 ```sh
 ./zig-out/bin/zig-protoc \
@@ -103,8 +105,19 @@ Standalone `zig-protoc` also supports `--out <file>`, `--out-dir <dir>`, `--root
   --out-dir generated_pb \
   --root-file root.zig \
   --depfile generated_pb/proto.d \
+  --minimal \
+  --only api.Request,api.Response \
   proto/api.proto
 ```
+
+### Minimal Codegen & Reachability Pruning
+
+For large schemas, you can cut generated code size and compile time without changing the core wire API (`decode`, `encodeSlice`, `encodeReverse`):
+
+- **Minimal profile (`--minimal`):** Omits optional helper families—ProtoJSON, `fieldIterator`, `format`/`cloneInto`/`cloneOwned` helpers, `decodeOnly`, forward `encode`/`encodedSize`, and `validateDepth` (while `proto_wire` falls back cleanly with zero allocations). Individual families can still be toggled via `--no-json` / `--emit-json`, `--no-iter` (`--no-field-iterator`) / `--emit-iter` (`--emit-field-iterator`), `--no-helpers` / `--emit-helpers`, `--no-decode-only` / `--emit-decode-only`, `--no-forward-encode` / `--emit-forward-encode`, and `--no-validate` / `--emit-validate`.
+- **Reachability pruning (`--only`):** Accepts comma-separated or repeated message, enum, or service roots (`pkg.Packet`, `Packet`, `MyService`) and emits only transitively referenced declarations (keeping bare namespace shells for nested types and skipping unreachable files in `--out-dir` / `root.zig`).
+- **`protoc-gen-zig` `--zig_opt` parameters:** Supports `minimal=true|false`, `emit_json=...`, `emit_field_iterator=...`, `emit_helpers=...`, `emit_decode_only=...`, `emit_forward_encode=...`, `emit_validate=...`, and `only=MsgA+MsgB` (or `;`-separated / repeated `only=...`).
+- **`build.zig` options (`addProtoModule` / `addProtoPackage`):** Exposes `.minimal = true`, nullable `.emit_*` overrides (`?bool`), and `.only_roots = &.{ ... }`.
 
 ---
 
@@ -205,7 +218,7 @@ const resp_frame = try protoz.rpc.dispatchUnaryGrpc(
 ## Scope & Intentional Boundaries
 
 - **Protobuf coverage:** Supports `proto2` (including `group`, `extensions`, `extend`, custom `defaults`, and transitive `required` validation), `proto3` (including `proto3 optional`), and **Edition 2023** (`field_presence`, `repeated_field_encoding`, `utf8_validation`, and `message_encoding = DELIMITED` in both `zig-protoc` and `protoc-gen-zig`).
-- **Not included in v0.1.0:** `import weak` (parsed and skipped), arbitrary runtime custom descriptor options, and `textproto` parsing (human-readable `{f}` debug formatting and ProtoJSON are provided instead).
+- **Not included in v0.1.1:** `import weak` (parsed and skipped), arbitrary runtime custom descriptor options, and `textproto` parsing (human-readable `{f}` debug formatting and ProtoJSON are provided instead).
 - **gRPC & transport:** `protoz.rpc` handles 5-byte Length-Prefixed framing and zero-allocation comptime dispatchers (`dispatchUnaryGrpc`, `dispatchClientStreamGrpc`, `dispatchServerStreamGrpc`, `dispatchBidiStreamGrpc`, `dispatchGrpc`). Compressed gRPC payloads (`compressed = 1`) are exposed via `rpc.tryDecodeGrpcRaw` for caller-chosen decompression, and full HTTP/2 transport (HPACK, TLS, multiplexing) is left to the application's transport layer.
 - **`google.protobuf.Any` in ProtoJSON:** Inline JSON expansion uses a zero-allocation comptime type tuple (`encodeMessageSliceWithTypes` / `decodeMessageWithTypes`); unregistered types fall back cleanly to `{"@type":"...","value":"<base64>"}`.
 
@@ -280,7 +293,7 @@ zig build fuzz -Doptimize=ReleaseFast -- --iters 5000000
 
 ```text
 ├── build.zig                    # Exports protoz, proto_wire, proto_wkt, zig-protoc, protoc-gen-zig
-├── build.zig.zon                # Zig package manifest (v0.1.0)
+├── build.zig.zon                # Zig package manifest (v0.1.1)
 ├── build_proto.zig              # Reusable build helpers (addProtoModule, addProtoPackage, *With)
 ├── LICENSE                      # MIT License
 ├── README.md
