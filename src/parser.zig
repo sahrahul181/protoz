@@ -480,6 +480,7 @@ pub const Parser = struct {
         var oneofs: std.ArrayList(ast.Oneof) = .empty;
         var nested_messages: std.ArrayList(ast.Message) = .empty;
         var nested_enums: std.ArrayList(ast.Enum) = .empty;
+        var options: std.ArrayList(ast.Option) = .empty;
         var reserved_ranges: std.ArrayList(ast.ReservedRange) = .empty;
         var reserved_names: std.ArrayList([]const u8) = .empty;
         var extension_ranges: std.ArrayList(ast.ReservedRange) = .empty;
@@ -503,7 +504,7 @@ pub const Parser = struct {
                 _ = self.advance();
                 try maps.append(self.arena, try self.parseMapField());
             } else if (isIdent(self.cur, "option") and self.peek1.kind != .eq) {
-                _ = try self.parseOptionStmt();
+                try options.append(self.arena, try self.parseOptionStmt());
             } else if (isIdent(self.cur, "reserved") and self.peek2.kind != .eq) {
                 try self.parseMessageReserved(&reserved_ranges, &reserved_names);
             } else if (isIdent(self.cur, "extensions") and self.peek1.kind == .number) {
@@ -526,6 +527,7 @@ pub const Parser = struct {
             .oneofs = try oneofs.toOwnedSlice(self.arena),
             .nested_messages = try nested_messages.toOwnedSlice(self.arena),
             .nested_enums = try nested_enums.toOwnedSlice(self.arena),
+            .options = try options.toOwnedSlice(self.arena),
             .reserved_ranges = try reserved_ranges.toOwnedSlice(self.arena),
             .reserved_names = try reserved_names.toOwnedSlice(self.arena),
             .extension_ranges = try extension_ranges.toOwnedSlice(self.arena),

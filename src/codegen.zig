@@ -352,8 +352,15 @@ fn writeCodecExpr(ctx: GenCtx, w: *std.Io.Writer, rt: resolver.ResolvedType, utf
     }
 }
 
-fn writeFieldCodecExpr(ctx: GenCtx, w: *std.Io.Writer, f: ast.Field, rt: resolver.ResolvedType, utf8_check: bool) !void {
-    if (f.is_group and rt == .message) {
+fn writeFieldCodecExpr(
+    ctx: GenCtx,
+    w: *std.Io.Writer,
+    msg_opts: []const ast.Option,
+    f: ast.Field,
+    rt: resolver.ResolvedType,
+    utf8_check: bool,
+) !void {
+    if (rt == .message and ctx.res.isDelimited(ctx.file_idx, msg_opts, f)) {
         try w.print("{s}.GroupCodec(", .{ctx.wire_alias});
         try ctx.writeSymPath(w, rt.message);
         try w.print(", {d})", .{f.number});
@@ -427,16 +434,18 @@ fn writeDefaultValueExpr(ctx: GenCtx, w: *std.Io.Writer, rt: resolver.ResolvedTy
 fn messageNeedsInitCheck(
     arena: std.mem.Allocator,
     res: *const resolver.Resolver,
+    file_idx: usize,
     scope_fqn: []const u8,
     m: ast.Message,
 ) !bool {
     var visited: std.StringHashMapUnmanaged(void) = .empty;
-    return messageNeedsInitCheckRec(arena, res, scope_fqn, m, &visited);
+    return messageNeedsInitCheckRec(arena, res, file_idx, scope_fqn, m, &visited);
 }
 
 fn messageNeedsInitCheckRec(
     arena: std.mem.Allocator,
     res: *const resolver.Resolver,
+    file_idx: usize,
     scope_fqn: []const u8,
     m: ast.Message,
     visited: *std.StringHashMapUnmanaged(void),
@@ -445,11 +454,11 @@ fn messageNeedsInitCheckRec(
     try visited.put(arena, scope_fqn, {});
 
     for (m.fields) |f| {
-        if (f.label == .required) return true;
+        if (res.isRequired(file_idx, m.options, f)) return true;
         const rt = try res.resolveType(scope_fqn, f.type_name);
         if (rt == .message) {
             if (rt.message.msg) |sub_m| {
-                if (try messageNeedsInitCheckRec(arena, res, rt.message.proto_fqn, sub_m.*, visited)) return true;
+                if (try messageNeedsInitCheckRec(arena, res, rt.message.file_index, rt.message.proto_fqn, sub_m.*, visited)) return true;
             }
         }
     }
@@ -457,7 +466,7 @@ fn messageNeedsInitCheckRec(
         const vt = try res.resolveType(scope_fqn, mp.value_type);
         if (vt == .message) {
             if (vt.message.msg) |sub_m| {
-                if (try messageNeedsInitCheckRec(arena, res, vt.message.proto_fqn, sub_m.*, visited)) return true;
+                if (try messageNeedsInitCheckRec(arena, res, vt.message.file_index, vt.message.proto_fqn, sub_m.*, visited)) return true;
             }
         }
     }
@@ -466,7 +475,7 @@ fn messageNeedsInitCheckRec(
             const rt = try res.resolveType(scope_fqn, f.type_name);
             if (rt == .message) {
                 if (rt.message.msg) |sub_m| {
-                    if (try messageNeedsInitCheckRec(arena, res, rt.message.proto_fqn, sub_m.*, visited)) return true;
+                    if (try messageNeedsInitCheckRec(arena, res, rt.message.file_index, rt.message.proto_fqn, sub_m.*, visited)) return true;
                 }
             }
         }
@@ -474,10 +483,10 @@ fn messageNeedsInitCheckRec(
     return false;
 }
 
-fn writeMapType(ctx: GenCtx, scope_fqn: []const u8, mp: ast.MapField, w: *std.Io.Writer) !void {
+fn writeMapType(ctx: GenCtx, scope_fqn: []const u8, msg_opts: []const ast.Option, mp: ast.MapField, w: *std.Io.Writer) !void {
     const kt = try ctx.res.resolveType(scope_fqn, mp.key_type);
     const vt = try ctx.res.resolveType(scope_fqn, mp.value_type);
-    const utf8 = ctx.res.validatesUtf8(ctx.file_idx, mp.options);
+    const utf8 = ctx.res.validatesUtf8(ctx.file_idx, msg_opts, mp.options);
     try w.print("{s}.Map(", .{ctx.wire_alias});
     try writeCodecExpr(ctx, w, kt, utf8);
     try w.writeAll(", ");
@@ -636,6 +645,7 @@ fn emitExtensions(
     indent: usize,
     used_names: *std.StringHashMapUnmanaged(void),
     check_msg_reserved: bool,
+    msg_opts: []const ast.Option,
     w: *std.Io.Writer,
 ) !void {
     for (extensions) |ext| {
@@ -643,7 +653,7 @@ fn emitExtensions(
         if (host_rt != .message) return error.ExtendeeMustBeMessage;
         for (ext.fields) |f| {
             const rt = try ctx.res.resolveType(scope_fqn, f.type_name);
-            const utf8 = ctx.res.validatesUtf8(ctx.file_idx, f.options);
+            const utf8 = ctx.res.validatesUtf8(ctx.file_idx, msg_opts, f.options);
             var zname = f.name;
             while (used_names.contains(zname) or (check_msg_reserved and isReservedMessageDecl(zname))) {
                 zname = try std.fmt.allocPrint(ctx.arena, "{s}_", .{zname});
@@ -660,7 +670,7 @@ fn emitExtensions(
             }
             try ctx.writeSymPath(w, host_rt.message);
             try w.print(", {d}, ", .{f.number});
-            try writeFieldCodecExpr(ctx, w, f, rt, utf8);
+            try writeFieldCodecExpr(ctx, w, msg_opts, f, rt, utf8);
             try w.writeAll(");\n");
         }
     }
@@ -781,7 +791,7 @@ pub fn generateFileWithOptions(
         for (file.enums) |e| try file_used.put(arena, e.name, {});
         for (file.messages) |m| try file_used.put(arena, m.name, {});
         for (file.services) |svc| try file_used.put(arena, svc.name, {});
-        try emitExtensions(ctx, file.extensions, pkg_scope, 0, &file_used, false, w);
+        try emitExtensions(ctx, file.extensions, pkg_scope, 0, &file_used, false, &.{}, w);
         try w.writeAll("\n");
     }
 }
@@ -938,14 +948,14 @@ fn emitMessage(parent_ctx: GenCtx, m: ast.Message, scope_fqn: []const u8, indent
 
     for (m.fields) |f| {
         const rt = try ctx.res.resolveType(scope_fqn, f.type_name);
-        const utf8 = ctx.res.validatesUtf8(ctx.file_idx, f.options);
+        const utf8 = ctx.res.validatesUtf8(ctx.file_idx, m.options, f.options);
         const zname = try zigFieldName(ctx.arena, m, f.name);
         try writeIndent(w, indent + 1);
         try writeIdent(w, zname);
         try w.writeAll(": ");
         if (f.label == .repeated) {
             try w.print("{s}.Repeated(", .{ctx.wire_alias});
-            try writeFieldCodecExpr(ctx, w, f, rt, utf8);
+            try writeFieldCodecExpr(ctx, w, m.options, f, rt, utf8);
             try w.writeAll(") = .empty,\n");
         } else if (rt == .message) {
             if (try ctx.res.createsCycle(scope_fqn, rt.message.proto_fqn)) {
@@ -957,7 +967,7 @@ fn emitMessage(parent_ctx: GenCtx, m: ast.Message, scope_fqn: []const u8, indent
                 try ctx.writeSymPath(w, rt.message);
                 try w.writeAll(" = null,\n");
             }
-        } else if (ctx.res.hasExplicitPresence(ctx.file_idx, f, rt)) {
+        } else if (ctx.res.hasExplicitPresence(ctx.file_idx, m.options, f, rt)) {
             try w.writeAll("?");
             switch (rt) {
                 .scalar => |s| try w.writeAll(s.zig_type),
@@ -982,7 +992,7 @@ fn emitMessage(parent_ctx: GenCtx, m: ast.Message, scope_fqn: []const u8, indent
         try writeIndent(w, indent + 1);
         try writeIdent(w, zname);
         try w.writeAll(": ");
-        try writeMapType(ctx, scope_fqn, mp, w);
+        try writeMapType(ctx, scope_fqn, m.options, mp, w);
         try w.writeAll(" = .empty,\n");
     }
 
@@ -1213,15 +1223,15 @@ fn emitMessage(parent_ctx: GenCtx, m: ast.Message, scope_fqn: []const u8, indent
         try w.writeAll("switch (raw_tag) {\n");
         for (m.fields) |f| {
             const rt = try ctx.res.resolveType(scope_fqn, f.type_name);
-            try emitFieldValidate(ctx, f, rt, indent + 4, w);
+            try emitFieldValidate(ctx, m, f, rt, indent + 4, w);
         }
         for (m.maps) |mp| {
             try writeIndent(w, indent + 4);
             try w.print("comptime {s}.rawTag({d}, .len) => try ", .{ ctx.wire_alias, mp.number });
-            try writeMapType(ctx, scope_fqn, mp, w);
+            try writeMapType(ctx, scope_fqn, m.options, mp, w);
             try w.writeAll(".validateEntry(try r.readBytes(), next_depth),\n");
         }
-        for (m.oneofs) |o| try emitOneofValidate(ctx, o, scope_fqn, indent + 4, w);
+        for (m.oneofs) |o| try emitOneofValidate(ctx, m, o, scope_fqn, indent + 4, w);
         try writeIndent(w, indent + 4);
         try w.writeAll("else => _ = try @This()._protozSkipOrReject(@This(), &r, raw_tag, next_depth),\n");
         try writeIndent(w, indent + 3);
@@ -1232,7 +1242,7 @@ fn emitMessage(parent_ctx: GenCtx, m: ast.Message, scope_fqn: []const u8, indent
     try writeIndent(w, indent + 1);
     try w.writeAll("}\n\n");
 
-    const needs_init_check = try messageNeedsInitCheck(ctx.arena, ctx.res, scope_fqn, m);
+    const needs_init_check = try messageNeedsInitCheck(ctx.arena, ctx.res, ctx.file_idx, scope_fqn, m);
     if (needs_init_check) {
         try writeIndent(w, indent + 1);
         try w.writeAll("pub fn isInitialized(self: *const @This()) bool {\n");
@@ -1249,9 +1259,10 @@ fn emitMessage(parent_ctx: GenCtx, m: ast.Message, scope_fqn: []const u8, indent
         for (m.fields) |f| {
             const rt = try ctx.res.resolveType(scope_fqn, f.type_name);
             const zname = try zigFieldName(ctx.arena, m, f.name);
+            const is_req = ctx.res.isRequired(ctx.file_idx, m.options, f);
             if (f.label == .repeated) {
                 if (rt == .message) {
-                    const sub_needs = if (rt.message.msg) |sm| try messageNeedsInitCheck(ctx.arena, ctx.res, rt.message.proto_fqn, sm.*) else false;
+                    const sub_needs = if (rt.message.msg) |sm| try messageNeedsInitCheck(ctx.arena, ctx.res, rt.message.file_index, rt.message.proto_fqn, sm.*) else false;
                     if (sub_needs) {
                         try writeIndent(w, indent + 2);
                         try w.writeAll("{ var it = self.");
@@ -1260,8 +1271,8 @@ fn emitMessage(parent_ctx: GenCtx, m: ast.Message, scope_fqn: []const u8, indent
                     }
                 }
             } else if (rt == .message) {
-                const sub_needs = if (rt.message.msg) |sm| try messageNeedsInitCheck(ctx.arena, ctx.res, rt.message.proto_fqn, sm.*) else false;
-                if (f.label == .required or sub_needs) {
+                const sub_needs = if (rt.message.msg) |sm| try messageNeedsInitCheck(ctx.arena, ctx.res, rt.message.file_index, rt.message.proto_fqn, sm.*) else false;
+                if (is_req or sub_needs) {
                     const cyclic = try ctx.res.createsCycle(scope_fqn, rt.message.proto_fqn);
                     try writeIndent(w, indent + 2);
                     try w.writeAll("if (self.");
@@ -1283,10 +1294,10 @@ fn emitMessage(parent_ctx: GenCtx, m: ast.Message, scope_fqn: []const u8, indent
                         }
                         try w.writeAll("}");
                     }
-                    if (f.label == .required) try w.writeAll(" else return false;");
+                    if (is_req) try w.writeAll(" else return false;");
                     try w.writeAll("\n");
                 }
-            } else if (f.label == .required and ctx.res.hasExplicitPresence(ctx.file_idx, f, rt)) {
+            } else if (is_req and ctx.res.hasExplicitPresence(ctx.file_idx, m.options, f, rt)) {
                 try writeIndent(w, indent + 2);
                 try w.writeAll("if (self.");
                 try writeIdent(w, zname);
@@ -1297,7 +1308,7 @@ fn emitMessage(parent_ctx: GenCtx, m: ast.Message, scope_fqn: []const u8, indent
         for (m.maps) |mp| {
             const vt = try ctx.res.resolveType(scope_fqn, mp.value_type);
             if (vt == .message) {
-                const sub_needs = if (vt.message.msg) |sm| try messageNeedsInitCheck(ctx.arena, ctx.res, vt.message.proto_fqn, sm.*) else false;
+                const sub_needs = if (vt.message.msg) |sm| try messageNeedsInitCheck(ctx.arena, ctx.res, vt.message.file_index, vt.message.proto_fqn, sm.*) else false;
                 if (sub_needs) {
                     const zname = try zigFieldName(ctx.arena, m, mp.name);
                     try writeIndent(w, indent + 2);
@@ -1314,7 +1325,7 @@ fn emitMessage(parent_ctx: GenCtx, m: ast.Message, scope_fqn: []const u8, indent
                 const rt = try ctx.res.resolveType(scope_fqn, f.type_name);
                 if (rt == .message) {
                     if (rt.message.msg) |sm| {
-                        if (try messageNeedsInitCheck(ctx.arena, ctx.res, rt.message.proto_fqn, sm.*)) {
+                        if (try messageNeedsInitCheck(ctx.arena, ctx.res, rt.message.file_index, rt.message.proto_fqn, sm.*)) {
                             covered_branches += 1;
                         }
                     }
@@ -1329,7 +1340,7 @@ fn emitMessage(parent_ctx: GenCtx, m: ast.Message, scope_fqn: []const u8, indent
             for (o.fields) |f| {
                 const rt = try ctx.res.resolveType(scope_fqn, f.type_name);
                 if (rt != .message) continue;
-                const sub_needs = if (rt.message.msg) |sm| try messageNeedsInitCheck(ctx.arena, ctx.res, rt.message.proto_fqn, sm.*) else false;
+                const sub_needs = if (rt.message.msg) |sm| try messageNeedsInitCheck(ctx.arena, ctx.res, rt.message.file_index, rt.message.proto_fqn, sm.*) else false;
                 if (!sub_needs) continue;
                 const cyclic = try ctx.res.createsCycle(scope_fqn, rt.message.proto_fqn);
                 try writeIndent(w, indent + 3);
@@ -1555,7 +1566,7 @@ fn emitMessage(parent_ctx: GenCtx, m: ast.Message, scope_fqn: []const u8, indent
         }
         if (ctx.opts.preserve_unknown_fields) try msg_used.put(ctx.arena, uf_name, {});
         try w.writeAll("\n");
-        try emitExtensions(ctx, m.extensions, scope_fqn, indent + 1, &msg_used, true, w);
+        try emitExtensions(ctx, m.extensions, scope_fqn, indent + 1, &msg_used, true, m.options, w);
     }
 
     try writeIndent(w, indent);
@@ -1577,7 +1588,7 @@ fn emitJsonMeta(ctx: GenCtx, m: ast.Message, scope_fqn: []const u8, indent: usiz
             .@"enum" => ".@\"enum\"",
             .message => |sym| if (try ctx.res.createsCycle(scope_fqn, sym.proto_fqn)) ".lazy_message" else ".message",
         };
-        const explicit = f.label != .repeated and rt != .message and ctx.res.hasExplicitPresence(ctx.file_idx, f, rt);
+        const explicit = f.label != .repeated and rt != .message and ctx.res.hasExplicitPresence(ctx.file_idx, m.options, f, rt);
         const zname = try zigFieldName(ctx.arena, m, f.name);
 
         try writeIndent(w, indent + 2);
@@ -1818,7 +1829,7 @@ fn emitFieldIterator(
 
     for (m.fields) |f| {
         const rt = try ctx.res.resolveType(scope_fqn, f.type_name);
-        const utf8 = ctx.res.validatesUtf8(ctx.file_idx, f.options);
+        const utf8 = ctx.res.validatesUtf8(ctx.file_idx, m.options, f.options);
         try writeIndent(w, indent + 3);
         try writeIdent(w, f.name);
         try w.writeAll(": ");
@@ -1838,7 +1849,7 @@ fn emitFieldIterator(
         try writeIndent(w, indent + 3);
         try writeIdent(w, mp.name);
         try w.writeAll(": ");
-        try writeMapType(ctx, scope_fqn, mp, w);
+        try writeMapType(ctx, scope_fqn, m.options, mp, w);
         try w.writeAll(".Entry,\n");
     }
 
@@ -1880,7 +1891,7 @@ fn emitFieldIterator(
 
         for (m.fields) |f| {
             const rt = try ctx.res.resolveType(scope_fqn, f.type_name);
-            const utf8 = ctx.res.validatesUtf8(ctx.file_idx, f.options);
+            const utf8 = ctx.res.validatesUtf8(ctx.file_idx, m.options, f.options);
             if (f.label == .repeated and isPackable(rt)) {
                 try writeIndent(w, indent + 4);
                 try w.print("comptime {s}.rawTag({d}, .len) => return .{{ .", .{ ctx.wire_alias, f.number });
@@ -1896,7 +1907,7 @@ fn emitFieldIterator(
                 try writeCodecExpr(ctx, w, rt, utf8);
                 try w.writeAll(".read(&self.r, self.depth) } },\n");
             } else if (rt == .message) {
-                if (f.is_group) {
+                if (ctx.res.isDelimited(ctx.file_idx, m.options, f)) {
                     try writeIndent(w, indent + 4);
                     try w.print("comptime {s}.rawTag({d}, .sgroup) => return .{{ .", .{ ctx.wire_alias, f.number });
                     try writeIdent(w, f.name);
@@ -1930,7 +1941,7 @@ fn emitFieldIterator(
             try w.writeAll("return .{ .");
             try writeIdent(w, mp.name);
             try w.writeAll(" = try ");
-            try writeMapType(ctx, scope_fqn, mp, w);
+            try writeMapType(ctx, scope_fqn, m.options, mp, w);
             try w.writeAll(".decodeEntry(entry_bytes, self.depth - 1) };\n");
             try writeIndent(w, indent + 4);
             try w.writeAll("},\n");
@@ -1939,9 +1950,9 @@ fn emitFieldIterator(
         for (m.oneofs) |o| {
             for (o.fields) |f| {
                 const rt = try ctx.res.resolveType(scope_fqn, f.type_name);
-                const utf8 = ctx.res.validatesUtf8(ctx.file_idx, f.options);
+                const utf8 = ctx.res.validatesUtf8(ctx.file_idx, m.options, f.options);
                 if (rt == .message) {
-                    if (f.is_group) {
+                    if (ctx.res.isDelimited(ctx.file_idx, m.options, f)) {
                         try writeIndent(w, indent + 4);
                         try w.print("comptime {s}.rawTag({d}, .sgroup) => return .{{ .", .{ ctx.wire_alias, f.number });
                         try writeIdent(w, f.name);
@@ -2018,7 +2029,7 @@ fn emitFieldIterator(
 fn emitFieldSize(ctx: GenCtx, m: ast.Message, f: ast.Field, rt: resolver.ResolvedType, indent: usize, w: *std.Io.Writer) !void {
     const zname = try zigFieldName(ctx.arena, m, f.name);
     if (f.label == .repeated) {
-        const pack = ctx.res.isPacked(ctx.file_idx, f);
+        const pack = ctx.res.isPacked(ctx.file_idx, m.options, f);
         try writeIndent(w, indent);
         try w.writeAll("total += self.");
         try writeIdent(w, zname);
@@ -2030,7 +2041,7 @@ fn emitFieldSize(ctx: GenCtx, m: ast.Message, f: ast.Field, rt: resolver.Resolve
         try w.writeAll("if (self.");
         try writeIdent(w, zname);
         try w.writeAll(") |val| {\n");
-        if (f.is_group) {
+        if (ctx.res.isDelimited(ctx.file_idx, m.options, f)) {
             try writeIndent(w, indent + 1);
             try w.print("total += {s}.tagSize({d}) * 2 + val.encodedSize();\n", .{ ctx.wire_alias, f.number });
         } else {
@@ -2043,8 +2054,8 @@ fn emitFieldSize(ctx: GenCtx, m: ast.Message, f: ast.Field, rt: resolver.Resolve
         try w.writeAll("}\n");
         return;
     }
-    const utf8 = ctx.res.validatesUtf8(ctx.file_idx, f.options);
-    if (ctx.res.hasExplicitPresence(ctx.file_idx, f, rt)) {
+    const utf8 = ctx.res.validatesUtf8(ctx.file_idx, m.options, f.options);
+    if (ctx.res.hasExplicitPresence(ctx.file_idx, m.options, f, rt)) {
         try writeIndent(w, indent);
         try w.writeAll("if (self.");
         try writeIdent(w, zname);
@@ -2068,7 +2079,7 @@ fn emitFieldSize(ctx: GenCtx, m: ast.Message, f: ast.Field, rt: resolver.Resolve
 fn emitFieldEncode(ctx: GenCtx, m: ast.Message, f: ast.Field, rt: resolver.ResolvedType, indent: usize, w: *std.Io.Writer) !void {
     const zname = try zigFieldName(ctx.arena, m, f.name);
     if (f.label == .repeated) {
-        const pack = ctx.res.isPacked(ctx.file_idx, f);
+        const pack = ctx.res.isPacked(ctx.file_idx, m.options, f);
         try writeIndent(w, indent);
         try w.writeAll("try self.");
         try writeIdent(w, zname);
@@ -2080,7 +2091,7 @@ fn emitFieldEncode(ctx: GenCtx, m: ast.Message, f: ast.Field, rt: resolver.Resol
         try w.writeAll("if (self.");
         try writeIdent(w, zname);
         try w.writeAll(") |val| {\n");
-        if (f.is_group) {
+        if (ctx.res.isDelimited(ctx.file_idx, m.options, f)) {
             try writeIndent(w, indent + 1);
             try w.print("try {s}.writeTag(w, {d}, .sgroup);\n", .{ ctx.wire_alias, f.number });
             try writeIndent(w, indent + 1);
@@ -2099,8 +2110,8 @@ fn emitFieldEncode(ctx: GenCtx, m: ast.Message, f: ast.Field, rt: resolver.Resol
         try w.writeAll("}\n");
         return;
     }
-    const utf8 = ctx.res.validatesUtf8(ctx.file_idx, f.options);
-    if (ctx.res.hasExplicitPresence(ctx.file_idx, f, rt)) {
+    const utf8 = ctx.res.validatesUtf8(ctx.file_idx, m.options, f.options);
+    if (ctx.res.hasExplicitPresence(ctx.file_idx, m.options, f, rt)) {
         try writeIndent(w, indent);
         try w.writeAll("if (self.");
         try writeIdent(w, zname);
@@ -2140,7 +2151,7 @@ fn emitFieldEncode(ctx: GenCtx, m: ast.Message, f: ast.Field, rt: resolver.Resol
 fn emitFieldReverse(ctx: GenCtx, m: ast.Message, f: ast.Field, rt: resolver.ResolvedType, indent: usize, w: *std.Io.Writer) !void {
     const zname = try zigFieldName(ctx.arena, m, f.name);
     if (f.label == .repeated) {
-        const pack = ctx.res.isPacked(ctx.file_idx, f);
+        const pack = ctx.res.isPacked(ctx.file_idx, m.options, f);
         try writeIndent(w, indent);
         try w.writeAll("try self.");
         try writeIdent(w, zname);
@@ -2152,7 +2163,7 @@ fn emitFieldReverse(ctx: GenCtx, m: ast.Message, f: ast.Field, rt: resolver.Reso
         try w.writeAll("if (self.");
         try writeIdent(w, zname);
         try w.writeAll(") |val| {\n");
-        if (f.is_group) {
+        if (ctx.res.isDelimited(ctx.file_idx, m.options, f)) {
             try writeIndent(w, indent + 1);
             try w.print("try rw.writeTag({d}, .egroup);\n", .{f.number});
             try writeIndent(w, indent + 1);
@@ -2173,8 +2184,8 @@ fn emitFieldReverse(ctx: GenCtx, m: ast.Message, f: ast.Field, rt: resolver.Reso
         try w.writeAll("}\n");
         return;
     }
-    const utf8 = ctx.res.validatesUtf8(ctx.file_idx, f.options);
-    if (ctx.res.hasExplicitPresence(ctx.file_idx, f, rt)) {
+    const utf8 = ctx.res.validatesUtf8(ctx.file_idx, m.options, f.options);
+    if (ctx.res.hasExplicitPresence(ctx.file_idx, m.options, f, rt)) {
         try writeIndent(w, indent);
         try w.writeAll("if (self.");
         try writeIdent(w, zname);
@@ -2211,8 +2222,9 @@ fn emitFieldReverse(ctx: GenCtx, m: ast.Message, f: ast.Field, rt: resolver.Reso
     }
 }
 
-fn emitFieldValidate(ctx: GenCtx, f: ast.Field, rt: resolver.ResolvedType, indent: usize, w: *std.Io.Writer) !void {
-    const utf8 = ctx.res.validatesUtf8(ctx.file_idx, f.options);
+fn emitFieldValidate(ctx: GenCtx, m: ast.Message, f: ast.Field, rt: resolver.ResolvedType, indent: usize, w: *std.Io.Writer) !void {
+    const utf8 = ctx.res.validatesUtf8(ctx.file_idx, m.options, f.options);
+    const delimited = (rt == .message and ctx.res.isDelimited(ctx.file_idx, m.options, f));
     if (f.label == .repeated) {
         if (isPackable(rt)) {
             try writeIndent(w, indent);
@@ -2227,14 +2239,14 @@ fn emitFieldValidate(ctx: GenCtx, f: ast.Field, rt: resolver.ResolvedType, inden
             try writeCodecExpr(ctx, w, rt, utf8);
             try w.writeAll(".validate(&r, next_depth),\n");
         } else {
-            const wt_str = if (f.is_group) ".sgroup" else ".len";
+            const wt_str = if (delimited) ".sgroup" else ".len";
             try writeIndent(w, indent);
             try w.print("comptime {s}.rawTag({d}, {s}) => try ", .{ ctx.wire_alias, f.number, wt_str });
-            try writeFieldCodecExpr(ctx, w, f, rt, utf8);
+            try writeFieldCodecExpr(ctx, w, m.options, f, rt, utf8);
             try w.writeAll(".validate(&r, next_depth),\n");
         }
     } else if (rt == .message) {
-        if (f.is_group) {
+        if (delimited) {
             try writeIndent(w, indent);
             try w.print("comptime {s}.rawTag({d}, .sgroup) => try ", .{ ctx.wire_alias, f.number });
             try ctx.writeSymPath(w, rt.message);
@@ -2256,7 +2268,8 @@ fn emitFieldValidate(ctx: GenCtx, f: ast.Field, rt: resolver.ResolvedType, inden
 }
 
 fn emitFieldDecode(ctx: GenCtx, m: ast.Message, f: ast.Field, rt: resolver.ResolvedType, scope_fqn: []const u8, indent: usize, w: *std.Io.Writer) !void {
-    const utf8 = ctx.res.validatesUtf8(ctx.file_idx, f.options);
+    const utf8 = ctx.res.validatesUtf8(ctx.file_idx, m.options, f.options);
+    const delimited = (rt == .message and ctx.res.isDelimited(ctx.file_idx, m.options, f));
     const zname = try zigFieldName(ctx.arena, m, f.name);
     if (f.label == .repeated) {
         if (isPackable(rt)) {
@@ -2290,7 +2303,7 @@ fn emitFieldDecode(ctx: GenCtx, m: ast.Message, f: ast.Field, rt: resolver.Resol
             try writeIndent(w, indent);
             try w.writeAll("},\n");
         } else {
-            const wt_str = if (f.is_group) ".sgroup" else ".len";
+            const wt_str = if (delimited) ".sgroup" else ".len";
             try writeIndent(w, indent);
             try w.print("comptime {s}.rawTag({d}, {s}) => if (comptime @hasField(Target, \"{s}\")) {{\n", .{ ctx.wire_alias, f.number, wt_str, zname });
             try writeIndent(w, indent + 1);
@@ -2300,7 +2313,7 @@ fn emitFieldDecode(ctx: GenCtx, m: ast.Message, f: ast.Field, rt: resolver.Resol
             try writeIndent(w, indent);
             try w.writeAll("} else {\n");
             try writeIndent(w, indent + 1);
-            if (f.is_group) {
+            if (delimited) {
                 try w.print("_ = try r.readGroupBytes({d}, next_depth);\n", .{f.number});
             } else {
                 try w.writeAll("try r.skipWireType(.len);\n");
@@ -2309,14 +2322,14 @@ fn emitFieldDecode(ctx: GenCtx, m: ast.Message, f: ast.Field, rt: resolver.Resol
             try w.writeAll("},\n");
         }
     } else if (rt == .message) {
-        const wt_str = if (f.is_group) ".sgroup" else ".len";
+        const wt_str = if (delimited) ".sgroup" else ".len";
         const cyclic = try ctx.res.createsCycle(scope_fqn, rt.message.proto_fqn);
         try writeIndent(w, indent);
         try w.print("comptime {s}.rawTag({d}, {s}) => {{\n", .{ ctx.wire_alias, f.number, wt_str });
         try writeIndent(w, indent + 1);
         try w.print("if (comptime @hasField(Target, \"{s}\")) {{\n", .{zname});
         try writeIndent(w, indent + 2);
-        if (f.is_group) {
+        if (delimited) {
             try w.print("const sub_bytes = try r.readGroupBytes({d}, next_depth);\n", .{f.number});
         } else {
             try w.writeAll("const sub_bytes = try r.readBytes();\n");
@@ -2361,7 +2374,7 @@ fn emitFieldDecode(ctx: GenCtx, m: ast.Message, f: ast.Field, rt: resolver.Resol
         try writeIndent(w, indent + 1);
         try w.writeAll("} else {\n");
         try writeIndent(w, indent + 2);
-        if (f.is_group) {
+        if (delimited) {
             try w.print("_ = try r.readGroupBytes({d}, next_depth);\n", .{f.number});
         } else {
             try w.writeAll("try r.skipWireType(.len);\n");
@@ -2401,13 +2414,13 @@ fn emitOneofSize(ctx: GenCtx, m: ast.Message, o: ast.Oneof, scope_fqn: []const u
     try w.writeAll(") |u| switch (u) {\n");
     for (o.fields) |f| {
         const rt = try ctx.res.resolveType(scope_fqn, f.type_name);
-        const utf8 = ctx.res.validatesUtf8(ctx.file_idx, f.options);
+        const utf8 = ctx.res.validatesUtf8(ctx.file_idx, m.options, f.options);
         try writeIndent(w, indent + 1);
         try w.writeAll(".");
         try writeIdent(w, f.name);
         try w.writeAll(" => |val| ");
         if (rt == .message) {
-            if (f.is_group) {
+            if (ctx.res.isDelimited(ctx.file_idx, m.options, f)) {
                 try w.print("total += {s}.tagSize({d}) * 2 + val.encodedSize(),\n", .{ ctx.wire_alias, f.number });
             } else {
                 try w.print("{{ const sub = val.encodedSize(); total += {s}.tagSize({d}) + {s}.varintSize(sub) + sub; }},\n", .{ ctx.wire_alias, f.number, ctx.wire_alias });
@@ -2431,13 +2444,13 @@ fn emitOneofEncode(ctx: GenCtx, m: ast.Message, o: ast.Oneof, scope_fqn: []const
     try w.writeAll(") |u| switch (u) {\n");
     for (o.fields) |f| {
         const rt = try ctx.res.resolveType(scope_fqn, f.type_name);
-        const utf8 = ctx.res.validatesUtf8(ctx.file_idx, f.options);
+        const utf8 = ctx.res.validatesUtf8(ctx.file_idx, m.options, f.options);
         try writeIndent(w, indent + 1);
         try w.writeAll(".");
         try writeIdent(w, f.name);
         try w.writeAll(" => |val| {\n");
         if (rt == .message) {
-            if (f.is_group) {
+            if (ctx.res.isDelimited(ctx.file_idx, m.options, f)) {
                 try writeIndent(w, indent + 2);
                 try w.print("try {s}.writeTag(w, {d}, .sgroup);\n", .{ ctx.wire_alias, f.number });
                 try writeIndent(w, indent + 2);
@@ -2478,13 +2491,13 @@ fn emitOneofReverse(ctx: GenCtx, m: ast.Message, o: ast.Oneof, scope_fqn: []cons
     try w.writeAll(") |u| switch (u) {\n");
     for (o.fields) |f| {
         const rt = try ctx.res.resolveType(scope_fqn, f.type_name);
-        const utf8 = ctx.res.validatesUtf8(ctx.file_idx, f.options);
+        const utf8 = ctx.res.validatesUtf8(ctx.file_idx, m.options, f.options);
         try writeIndent(w, indent + 1);
         try w.writeAll(".");
         try writeIdent(w, f.name);
         try w.writeAll(" => |val| {\n");
         if (rt == .message) {
-            if (f.is_group) {
+            if (ctx.res.isDelimited(ctx.file_idx, m.options, f)) {
                 try writeIndent(w, indent + 2);
                 try w.print("try rw.writeTag({d}, .egroup);\n", .{f.number});
                 try writeIndent(w, indent + 2);
@@ -2518,13 +2531,13 @@ fn emitOneofReverse(ctx: GenCtx, m: ast.Message, o: ast.Oneof, scope_fqn: []cons
     try w.writeAll("};\n");
 }
 
-fn emitOneofValidate(ctx: GenCtx, o: ast.Oneof, scope_fqn: []const u8, indent: usize, w: *std.Io.Writer) !void {
+fn emitOneofValidate(ctx: GenCtx, m: ast.Message, o: ast.Oneof, scope_fqn: []const u8, indent: usize, w: *std.Io.Writer) !void {
     for (o.fields) |f| {
         const rt = try ctx.res.resolveType(scope_fqn, f.type_name);
-        const utf8 = ctx.res.validatesUtf8(ctx.file_idx, f.options);
+        const utf8 = ctx.res.validatesUtf8(ctx.file_idx, m.options, f.options);
         try writeIndent(w, indent);
         if (rt == .message) {
-            if (f.is_group) {
+            if (ctx.res.isDelimited(ctx.file_idx, m.options, f)) {
                 try w.print("comptime {s}.rawTag({d}, .sgroup) => try ", .{ ctx.wire_alias, f.number });
                 try ctx.writeSymPath(w, rt.message);
                 try w.print(".validateDepth(try r.readGroupBytes({d}, next_depth), next_depth),\n", .{f.number});
@@ -2547,16 +2560,17 @@ fn emitOneofDecode(ctx: GenCtx, m: ast.Message, o: ast.Oneof, scope_fqn: []const
     const o_zname = try zigFieldName(ctx.arena, m, o.name);
     for (o.fields) |f| {
         const rt = try ctx.res.resolveType(scope_fqn, f.type_name);
-        const utf8 = ctx.res.validatesUtf8(ctx.file_idx, f.options);
+        const utf8 = ctx.res.validatesUtf8(ctx.file_idx, m.options, f.options);
         if (rt == .message) {
-            const wt_str = if (f.is_group) ".sgroup" else ".len";
+            const delimited = ctx.res.isDelimited(ctx.file_idx, m.options, f);
+            const wt_str = if (delimited) ".sgroup" else ".len";
             const cyclic = try ctx.res.createsCycle(scope_fqn, rt.message.proto_fqn);
             try writeIndent(w, indent);
             try w.print("comptime {s}.rawTag({d}, {s}) => {{\n", .{ ctx.wire_alias, f.number, wt_str });
             try writeIndent(w, indent + 1);
             try w.print("if (comptime @hasField(Target, \"{s}\")) {{\n", .{o_zname});
             try writeIndent(w, indent + 2);
-            if (f.is_group) {
+            if (delimited) {
                 try w.print("const sub_bytes = try r.readGroupBytes({d}, next_depth);\n", .{f.number});
             } else {
                 try w.writeAll("const sub_bytes = try r.readBytes();\n");
@@ -2621,7 +2635,7 @@ fn emitOneofDecode(ctx: GenCtx, m: ast.Message, o: ast.Oneof, scope_fqn: []const
             try writeIndent(w, indent + 1);
             try w.writeAll("} else {\n");
             try writeIndent(w, indent + 2);
-            if (f.is_group) {
+            if (delimited) {
                 try w.print("_ = try r.readGroupBytes({d}, next_depth);\n", .{f.number});
             } else {
                 try w.writeAll("try r.skipWireType(.len);\n");

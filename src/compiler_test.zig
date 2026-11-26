@@ -162,11 +162,11 @@ test "resolver + codegen: Edition 2023 defaults, feature overrides, keyword path
     const res = try resolver.Resolver.build(arena, &file);
 
     const env = file.messages[1];
-    try std.testing.expect(res.hasExplicitPresence(0, env.fields[0], .{ .scalar = resolver.lookupScalar("int32").? }));
-    try std.testing.expect(!res.hasExplicitPresence(0, env.fields[1], .{ .scalar = resolver.lookupScalar("int32").? }));
-    try std.testing.expect(res.validatesUtf8(0, env.fields[2].options));
-    try std.testing.expect(!res.validatesUtf8(0, env.fields[3].options));
-    try std.testing.expect(!res.isPacked(0, env.fields[4]));
+    try std.testing.expect(res.hasExplicitPresence(0, env.options, env.fields[0], .{ .scalar = resolver.lookupScalar("int32").? }));
+    try std.testing.expect(!res.hasExplicitPresence(0, env.options, env.fields[1], .{ .scalar = resolver.lookupScalar("int32").? }));
+    try std.testing.expect(res.validatesUtf8(0, env.options, env.fields[2].options));
+    try std.testing.expect(!res.validatesUtf8(0, env.options, env.fields[3].options));
+    try std.testing.expect(!res.isPacked(0, env.options, env.fields[4]));
 
     var out: std.Io.Writer.Allocating = .init(arena);
     try codegen.generateFile(arena, 0, &res, &out.writer);
@@ -258,7 +258,9 @@ test "plugin: decodes CodeGeneratorRequest with allow_alias, map_entry, and prot
     while (try r.readTag()) |tag| {
         switch (tag.field_number) {
             1 => return error.UnexpectedPluginError,
-            2 => try std.testing.expectEqual(plugin.feature_proto3_optional, try r.readVarint()),
+            2 => try std.testing.expectEqual(plugin.feature_proto3_optional | plugin.feature_supports_editions, try r.readVarint()),
+            3 => try std.testing.expectEqual(@as(i64, plugin.edition_proto2), @as(i64, @bitCast(try r.readVarint()))),
+            4 => try std.testing.expectEqual(@as(i64, plugin.edition_2023), @as(i64, @bitCast(try r.readVarint()))),
             15 => {
                 var fr = wire.Reader.init(try r.readBytes());
                 while (try fr.readTag()) |ft| {
@@ -1671,4 +1673,172 @@ test "plugin: decodes CodeGeneratorRequest with TYPE_GROUP, extension_range, ext
     try std.testing.expect(std.mem.indexOf(u8, gen_content, "pub const nested_ext = wire.Extension(Envelope, 105, wire.ScalarCodec(.uint64));") != null);
     try std.testing.expect(std.mem.indexOf(u8, gen_content, "pub const note = wire.Extension(Envelope, 100, wire.ScalarCodec(.string));") != null);
     try std.testing.expect(std.mem.indexOf(u8, gen_content, "pub const audit = wire.Extension(Envelope, 102, wire.GroupCodec(Envelope.Audit, 102));") != null);
+}
+
+fn writeFeatureSet(
+    arena: std.mem.Allocator,
+    opts: struct {
+        field_presence: ?u64 = null,
+        repeated_field_encoding: ?u64 = null,
+        utf8_validation: ?u64 = null,
+        message_encoding: ?u64 = null,
+    },
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    const w = &out.writer;
+    if (opts.field_presence) |v| {
+        try wire.writeTag(w, 1, .varint);
+        try wire.writeVarint(w, v);
+    }
+    if (opts.repeated_field_encoding) |v| {
+        try wire.writeTag(w, 3, .varint);
+        try wire.writeVarint(w, v);
+    }
+    if (opts.utf8_validation) |v| {
+        try wire.writeTag(w, 4, .varint);
+        try wire.writeVarint(w, v);
+    }
+    if (opts.message_encoding) |v| {
+        try wire.writeTag(w, 5, .varint);
+        try wire.writeVarint(w, v);
+    }
+    return out.toOwnedSlice();
+}
+
+test "edition 2023: DELIMITED message encoding, LEGACY_REQUIRED, and plugin FeatureSet" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // 1. zig-protoc frontend: DELIMITED + LEGACY_REQUIRED
+    const src =
+        \\edition = "2023";
+        \\package ed.v1;
+        \\message Child {
+        \\  string id = 1 [features.field_presence = LEGACY_REQUIRED];
+        \\}
+        \\message Parent {
+        \\  option features.message_encoding = DELIMITED;
+        \\  Child child = 1;
+        \\  repeated Child items = 2;
+        \\}
+    ;
+    const file = try parser.Parser.parse(arena, src);
+    const res = try resolver.Resolver.build(arena, &file);
+
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try codegen.generateFile(arena, 0, &res, &out.writer);
+    const gen = out.written();
+
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub fn isInitialized(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "try wire.writeTag(w, 1, .sgroup);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "try wire.writeTag(w, 1, .egroup);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "items: wire.Repeated(wire.GroupCodec(Child, 2)) = .empty,") != null);
+
+    // 2. protoc-gen-zig binary FeatureSet decoding (FileOptions.features=50, MessageOptions.features=12, FieldOptions.features=21)
+    const f_child_id_feat = try writeFeatureSet(arena, .{ .field_presence = 3 }); // LEGACY_REQUIRED
+    var f_child_id_opts: std.Io.Writer.Allocating = .init(arena);
+    try wire.writeTag(&f_child_id_opts.writer, 21, .len);
+    try wire.writeBytes(&f_child_id_opts.writer, f_child_id_feat);
+
+    var f_child_id: std.Io.Writer.Allocating = .init(arena);
+    try f_child_id.writer.writeAll(try writeDescriptorField(arena, .{
+        .name = "id",
+        .number = 1,
+        .label = 1,
+        .type_enum = 9, // STRING
+    }));
+    try wire.writeTag(&f_child_id.writer, 8, .len);
+    try wire.writeBytes(&f_child_id.writer, f_child_id_opts.written());
+
+    var child_desc: std.Io.Writer.Allocating = .init(arena);
+    try wire.writeTag(&child_desc.writer, 1, .len);
+    try wire.writeBytes(&child_desc.writer, "Child");
+    try wire.writeTag(&child_desc.writer, 2, .len);
+    try wire.writeBytes(&child_desc.writer, f_child_id.written());
+
+    const msg_feat = try writeFeatureSet(arena, .{ .message_encoding = 2 }); // DELIMITED
+    var msg_opts: std.Io.Writer.Allocating = .init(arena);
+    try wire.writeTag(&msg_opts.writer, 12, .len);
+    try wire.writeBytes(&msg_opts.writer, msg_feat);
+
+    var parent_desc: std.Io.Writer.Allocating = .init(arena);
+    {
+        const w = &parent_desc.writer;
+        try wire.writeTag(w, 1, .len);
+        try wire.writeBytes(w, "Parent");
+        try wire.writeTag(w, 2, .len);
+        try wire.writeBytes(w, try writeDescriptorField(arena, .{
+            .name = "child",
+            .number = 1,
+            .label = 1,
+            .type_enum = 11, // MESSAGE
+            .type_name = ".ed.v1.Child",
+        }));
+        try wire.writeTag(w, 2, .len);
+        try wire.writeBytes(w, try writeDescriptorField(arena, .{
+            .name = "items",
+            .number = 2,
+            .label = 3, // REPEATED
+            .type_enum = 11,
+            .type_name = ".ed.v1.Child",
+        }));
+        try wire.writeTag(w, 7, .len);
+        try wire.writeBytes(w, msg_opts.written());
+    }
+
+    // FileOptions { features = { utf8_validation = NONE (3) } }
+    const file_feat = try writeFeatureSet(arena, .{ .utf8_validation = 3 });
+    var file_opts: std.Io.Writer.Allocating = .init(arena);
+    try wire.writeTag(&file_opts.writer, 50, .len);
+    try wire.writeBytes(&file_opts.writer, file_feat);
+
+    var fd: std.Io.Writer.Allocating = .init(arena);
+    {
+        const w = &fd.writer;
+        try wire.writeTag(w, 1, .len);
+        try wire.writeBytes(w, "ed/test.proto");
+        try wire.writeTag(w, 2, .len);
+        try wire.writeBytes(w, "ed.v1");
+        try wire.writeTag(w, 4, .len);
+        try wire.writeBytes(w, child_desc.written());
+        try wire.writeTag(w, 4, .len);
+        try wire.writeBytes(w, parent_desc.written());
+        try wire.writeTag(w, 8, .len);
+        try wire.writeBytes(w, file_opts.written());
+        try wire.writeTag(w, 12, .len);
+        try wire.writeBytes(w, "editions");
+        try wire.writeTag(w, 14, .varint);
+        try wire.writeVarint(w, @bitCast(@as(i64, plugin.edition_2023)));
+    }
+
+    var req: std.Io.Writer.Allocating = .init(arena);
+    try wire.writeTag(&req.writer, 1, .len);
+    try wire.writeBytes(&req.writer, "ed/test.proto");
+    try wire.writeTag(&req.writer, 15, .len);
+    try wire.writeBytes(&req.writer, fd.written());
+
+    const resp = try plugin.processRequest(arena, req.written());
+    var r = wire.Reader.init(resp);
+    var plugin_gen: []const u8 = "";
+    var features_val: u64 = 0;
+    while (try r.readTag()) |tag| {
+        switch (tag.field_number) {
+            1 => return error.UnexpectedPluginError,
+            2 => features_val = try r.readVarint(),
+            15 => {
+                var fr = wire.Reader.init(try r.readBytes());
+                while (try fr.readTag()) |ft| {
+                    if (ft.field_number == 15) plugin_gen = try fr.readBytes() else try fr.skipField(ft, wire.max_recursion_depth);
+                }
+            },
+            else => try r.skipField(tag, wire.max_recursion_depth),
+        }
+    }
+
+    try std.testing.expectEqual(plugin.feature_proto3_optional | plugin.feature_supports_editions, features_val);
+    try std.testing.expect(std.mem.indexOf(u8, plugin_gen, "pub fn isInitialized(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plugin_gen, "wire.ScalarCodec(.string)") != null); // FileOptions.features NONE
+    try std.testing.expect(std.mem.indexOf(u8, plugin_gen, "try wire.writeTag(w, 1, .sgroup);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plugin_gen, "items: wire.Repeated(wire.GroupCodec(Child, 2)) = .empty,") != null);
 }

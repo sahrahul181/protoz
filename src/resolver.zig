@@ -385,35 +385,79 @@ pub const Resolver = struct {
         return error.UnknownType;
     }
 
-    pub fn isPacked(self: *const Resolver, file_idx: usize, f: ast.Field) bool {
+    fn findFeatureOption(
+        self: *const Resolver,
+        file_idx: usize,
+        msg_opts: []const ast.Option,
+        field_opts: []const ast.Option,
+        name: []const u8,
+    ) ?[]const u8 {
+        return findOption(field_opts, name) orelse
+            findOption(msg_opts, name) orelse
+            findOption(self.files[file_idx].options, name);
+    }
+
+    pub fn isDelimited(
+        self: *const Resolver,
+        file_idx: usize,
+        msg_opts: []const ast.Option,
+        f: ast.Field,
+    ) bool {
+        if (f.is_group) return true;
+        if (self.findFeatureOption(file_idx, msg_opts, f.options, "features.message_encoding")) |enc| {
+            return std.mem.eql(u8, enc, "DELIMITED");
+        }
+        return false;
+    }
+
+    pub fn isRequired(
+        self: *const Resolver,
+        file_idx: usize,
+        msg_opts: []const ast.Option,
+        f: ast.Field,
+    ) bool {
+        if (f.label == .repeated) return false;
+        if (f.label == .required) return true;
+        if (self.findFeatureOption(file_idx, msg_opts, f.options, "features.field_presence")) |pres| {
+            return std.mem.eql(u8, pres, "LEGACY_REQUIRED");
+        }
+        return false;
+    }
+
+    pub fn isPacked(self: *const Resolver, file_idx: usize, msg_opts: []const ast.Option, f: ast.Field) bool {
         if (findOption(f.options, "packed")) |v| {
             return std.mem.eql(u8, v, "true");
         }
-        if (findOption(f.options, "features.repeated_field_encoding") orelse
-            findOption(self.files[file_idx].options, "features.repeated_field_encoding")) |enc|
-        {
+        if (self.findFeatureOption(file_idx, msg_opts, f.options, "features.repeated_field_encoding")) |enc| {
             if (std.mem.eql(u8, enc, "EXPANDED")) return false;
             if (std.mem.eql(u8, enc, "PACKED")) return true;
         }
         return self.files[file_idx].syntax != .proto2;
     }
 
-    pub fn hasExplicitPresence(self: *const Resolver, file_idx: usize, f: ast.Field, rt: ResolvedType) bool {
+    pub fn hasExplicitPresence(
+        self: *const Resolver,
+        file_idx: usize,
+        msg_opts: []const ast.Option,
+        f: ast.Field,
+        rt: ResolvedType,
+    ) bool {
         if (rt == .message) return true;
         if (f.label == .optional or f.label == .required) return true;
-        if (findOption(f.options, "features.field_presence") orelse
-            findOption(self.files[file_idx].options, "features.field_presence")) |pres|
-        {
+        if (self.findFeatureOption(file_idx, msg_opts, f.options, "features.field_presence")) |pres| {
             if (std.mem.eql(u8, pres, "IMPLICIT")) return false;
             if (std.mem.eql(u8, pres, "EXPLICIT") or std.mem.eql(u8, pres, "LEGACY_REQUIRED")) return true;
         }
         return self.files[file_idx].syntax != .proto3;
     }
 
-    pub fn validatesUtf8(self: *const Resolver, file_idx: usize, field_opts: []const ast.Option) bool {
-        if (findOption(field_opts, "features.utf8_validation") orelse
-            findOption(self.files[file_idx].options, "features.utf8_validation")) |mode|
-        {
+    pub fn validatesUtf8(
+        self: *const Resolver,
+        file_idx: usize,
+        msg_opts: []const ast.Option,
+        field_opts: []const ast.Option,
+    ) bool {
+        if (self.findFeatureOption(file_idx, msg_opts, field_opts, "features.utf8_validation")) |mode| {
             if (std.mem.eql(u8, mode, "NONE")) return false;
             if (std.mem.eql(u8, mode, "VERIFY")) return true;
         }
