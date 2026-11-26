@@ -27,11 +27,19 @@ pub const Response = struct {
 pub const PluginOptions = struct {
     wire_import: []const u8 = "proto_wire",
     root_file: ?[]const u8 = null,
-    preserve_unknown_fields: bool = false,
+    codegen_opts: codegen.CodegenOptions = .{},
+    only_roots: []const []const u8 = &.{},
 };
 
-fn parsePluginParams(raw: []const u8) !PluginOptions {
+fn parseBoolVal(val: []const u8) !bool {
+    if (std.mem.eql(u8, val, "true") or std.mem.eql(u8, val, "1")) return true;
+    if (std.mem.eql(u8, val, "false") or std.mem.eql(u8, val, "0")) return false;
+    return error.InvalidPluginParameter;
+}
+
+fn parsePluginParams(arena: std.mem.Allocator, raw: []const u8) !PluginOptions {
     var opts: PluginOptions = .{};
+    var roots: std.ArrayList([]const u8) = .empty;
     if (raw.len == 0) return opts;
 
     var it = std.mem.splitScalar(u8, raw, ',');
@@ -44,21 +52,41 @@ fn parsePluginParams(raw: []const u8) !PluginOptions {
         if (std.mem.eql(u8, key, "wire_import")) {
             if (val.len == 0) return error.InvalidPluginParameter;
             opts.wire_import = val;
+            opts.codegen_opts.wire_import = val;
         } else if (std.mem.eql(u8, key, "root_file")) {
             if (val.len == 0) return error.InvalidPluginParameter;
             opts.root_file = val;
         } else if (std.mem.eql(u8, key, "preserve_unknown_fields")) {
-            if (std.mem.eql(u8, val, "true") or std.mem.eql(u8, val, "1")) {
-                opts.preserve_unknown_fields = true;
-            } else if (std.mem.eql(u8, val, "false") or std.mem.eql(u8, val, "0")) {
-                opts.preserve_unknown_fields = false;
-            } else {
-                return error.InvalidPluginParameter;
+            opts.codegen_opts.preserve_unknown_fields = try parseBoolVal(val);
+        } else if (std.mem.eql(u8, key, "minimal")) {
+            if (try parseBoolVal(val)) {
+                opts.codegen_opts.emit_json = false;
+                opts.codegen_opts.emit_field_iterator = false;
+                opts.codegen_opts.emit_helpers = false;
+                opts.codegen_opts.emit_decode_only = false;
+                opts.codegen_opts.emit_forward_encode = false;
+                opts.codegen_opts.emit_validate = false;
             }
+        } else if (std.mem.eql(u8, key, "emit_json")) {
+            opts.codegen_opts.emit_json = try parseBoolVal(val);
+        } else if (std.mem.eql(u8, key, "emit_field_iterator")) {
+            opts.codegen_opts.emit_field_iterator = try parseBoolVal(val);
+        } else if (std.mem.eql(u8, key, "emit_helpers")) {
+            opts.codegen_opts.emit_helpers = try parseBoolVal(val);
+        } else if (std.mem.eql(u8, key, "emit_decode_only")) {
+            opts.codegen_opts.emit_decode_only = try parseBoolVal(val);
+        } else if (std.mem.eql(u8, key, "emit_forward_encode")) {
+            opts.codegen_opts.emit_forward_encode = try parseBoolVal(val);
+        } else if (std.mem.eql(u8, key, "emit_validate")) {
+            opts.codegen_opts.emit_validate = try parseBoolVal(val);
+        } else if (std.mem.eql(u8, key, "only")) {
+            var rit = std.mem.tokenizeAny(u8, val, "+;");
+            while (rit.next()) |rname| try roots.append(arena, rname);
         } else {
             return error.UnknownPluginParameter;
         }
     }
+    opts.only_roots = try roots.toOwnedSlice(arena);
     return opts;
 }
 
@@ -127,21 +155,26 @@ fn processRequestTyped(arena: std.mem.Allocator, req_bytes: []const u8) !Respons
         }
     }
 
-    const opts = try parsePluginParams(parameter);
+    const opts = try parsePluginParams(arena, parameter);
     const all_files = try ast_files.toOwnedSlice(arena);
     const res = try resolver.Resolver.buildMulti(arena, all_files);
+
+    var cg_opts = opts.codegen_opts;
+    var reachable_set: codegen.ReachableSet = .{};
+    if (opts.only_roots.len > 0) {
+        reachable_set = try codegen.computeReachable(arena, &res, opts.only_roots);
+        cg_opts.reachable = &reachable_set;
+    }
 
     var generated: std.ArrayList(GeneratedFile) = .empty;
     var generated_protos: std.ArrayList([]const u8) = .empty;
 
     for (all_files, 0..) |file, idx| {
         if (!files_to_gen.contains(file.name)) continue;
+        if (cg_opts.reachable) |rs| if (!rs.files.contains(idx)) continue;
 
         var buf: std.Io.Writer.Allocating = .init(arena);
-        try codegen.generateFileWithOptions(arena, idx, &res, &buf.writer, .{
-            .wire_import = opts.wire_import,
-            .preserve_unknown_fields = opts.preserve_unknown_fields,
-        });
+        try codegen.generateFileWithOptions(arena, idx, &res, &buf.writer, cg_opts);
 
         try generated_protos.append(arena, file.name);
         try generated.append(arena, .{

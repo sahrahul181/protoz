@@ -830,7 +830,12 @@ pub fn MessageCodec(comptime M: type) type {
         }
 
         pub fn validate(r: *Reader, depth: u32) DecodeError!void {
-            try M.validateDepth(try r.readBytes(), depth);
+            const b = try r.readBytes();
+            if (comptime @hasDecl(M, "validateDepth")) {
+                try M.validateDepth(b, depth);
+            } else {
+                _ = try M.decodeDepth(b, depth);
+            }
         }
     };
 }
@@ -931,28 +936,46 @@ pub fn Lazy(comptime M: type) type {
             };
         }
 
+        fn wireEncodedSize(w: WireFieldView) usize {
+            var total: usize = 0;
+            var r = Reader.init(w.buf);
+            const expected_len: u32 = (@as(u32, w.field_number) << 3) | @backingInt(WireType.len);
+            const expected_grp: u32 = (@as(u32, w.field_number) << 3) | @backingInt(WireType.sgroup);
+            while (r.readRawTag() catch return 0) |raw_tag| {
+                if (raw_tag == expected_len) {
+                    total += (r.readBytes() catch return 0).len;
+                } else if (raw_tag == expected_grp) {
+                    total += (r.readGroupBytes(w.field_number, max_recursion_depth) catch return 0).len;
+                } else {
+                    const tag = decodeTag(raw_tag) catch return 0;
+                    r.skipField(tag, max_recursion_depth) catch return 0;
+                }
+            }
+            return total;
+        }
+
+        fn writeWireBytes(wf: WireFieldView, w: anytype) WriterError(@TypeOf(w))!void {
+            var r = Reader.init(wf.buf);
+            const expected_len: u32 = (@as(u32, wf.field_number) << 3) | @backingInt(WireType.len);
+            const expected_grp: u32 = (@as(u32, wf.field_number) << 3) | @backingInt(WireType.sgroup);
+            while (r.readRawTag() catch unreachable) |raw_tag| {
+                if (raw_tag == expected_len) {
+                    try w.writeAll(r.readBytes() catch unreachable);
+                } else if (raw_tag == expected_grp) {
+                    try w.writeAll(r.readGroupBytes(wf.field_number, max_recursion_depth) catch unreachable);
+                } else {
+                    const tag = decodeTag(raw_tag) catch unreachable;
+                    r.skipField(tag, max_recursion_depth) catch unreachable;
+                }
+            }
+        }
+
         pub fn encodedSize(self: @This()) usize {
             return switch (self) {
                 .raw => |b| b.len,
                 .raw_wire => |rw_slice| rw_slice.data.len,
                 .ptr => |p| p.encodedSize(),
-                .wire => |w| blk: {
-                    var total: usize = 0;
-                    var r = Reader.init(w.buf);
-                    const expected_len: u32 = (@as(u32, w.field_number) << 3) | @backingInt(WireType.len);
-                    const expected_grp: u32 = (@as(u32, w.field_number) << 3) | @backingInt(WireType.sgroup);
-                    while (r.readRawTag() catch return 0) |raw_tag| {
-                        if (raw_tag == expected_len) {
-                            total += (r.readBytes() catch return 0).len;
-                        } else if (raw_tag == expected_grp) {
-                            total += (r.readGroupBytes(w.field_number, max_recursion_depth) catch return 0).len;
-                        } else {
-                            const tag = decodeTag(raw_tag) catch return 0;
-                            r.skipField(tag, max_recursion_depth) catch return 0;
-                        }
-                    }
-                    break :blk total;
-                },
+                .wire => |w| wireEncodedSize(w),
                 .pair => |pr| @as(usize, pr.lens[0]) + @as(usize, pr.lens[1]),
             };
         }
@@ -962,21 +985,7 @@ pub fn Lazy(comptime M: type) type {
                 .raw => |b| try w.writeAll(b),
                 .raw_wire => |rw_slice| try w.writeAll(rw_slice.data),
                 .ptr => |p| try p.encode(w),
-                .wire => |wf| {
-                    var r = Reader.init(wf.buf);
-                    const expected_len: u32 = (@as(u32, wf.field_number) << 3) | @backingInt(WireType.len);
-                    const expected_grp: u32 = (@as(u32, wf.field_number) << 3) | @backingInt(WireType.sgroup);
-                    while (r.readRawTag() catch unreachable) |raw_tag| {
-                        if (raw_tag == expected_len) {
-                            try w.writeAll(r.readBytes() catch unreachable);
-                        } else if (raw_tag == expected_grp) {
-                            try w.writeAll(r.readGroupBytes(wf.field_number, max_recursion_depth) catch unreachable);
-                        } else {
-                            const tag = decodeTag(raw_tag) catch unreachable;
-                            r.skipField(tag, max_recursion_depth) catch unreachable;
-                        }
-                    }
-                },
+                .wire => |wf| try writeWireBytes(wf, w),
                 .pair => |pr| {
                     try w.writeAll(pr.ptrs[0][0..pr.lens[0]]);
                     try w.writeAll(pr.ptrs[1][0..pr.lens[1]]);
@@ -989,12 +998,12 @@ pub fn Lazy(comptime M: type) type {
                 .raw => |b| try rw.writeAll(b),
                 .raw_wire => |rw_slice| try rw.writeAll(rw_slice.data),
                 .ptr => |p| try p.encodeReverse(rw),
-                .wire => {
-                    const sz = self.encodedSize();
+                .wire => |wf| {
+                    const sz = wireEncodedSize(wf);
                     if (sz == 0) return;
                     const dst = try rw.reserve(sz);
                     var sw = SliceWriter.init(dst);
-                    try self.encode(&sw);
+                    try writeWireBytes(wf, &sw);
                 },
                 .pair => |pr| {
                     try rw.writeAll(pr.ptrs[1][0..pr.lens[1]]);
@@ -1014,6 +1023,36 @@ pub const WireFieldView = struct {
     buf: []const u8,
     field_number: u29,
 };
+
+fn rawFieldSpanSize(buf: []const u8, field_number: u29, comptime wt: WireType) usize {
+    var total: usize = 0;
+    var r = Reader.init(buf);
+    const expected: u32 = (@as(u32, field_number) << 3) | @backingInt(wt);
+    while (true) {
+        const start = r.ptr;
+        const raw_tag = (r.readRawTag() catch return 0) orelse break;
+        const tag = decodeTag(raw_tag) catch return 0;
+        r.skipField(tag, max_recursion_depth) catch return 0;
+        if (raw_tag == expected) {
+            total += @intFromPtr(r.ptr) - @intFromPtr(start);
+        }
+    }
+    return total;
+}
+
+fn writeRawFieldSpans(buf: []const u8, field_number: u29, comptime wt: WireType, w: anytype) WriterError(@TypeOf(w))!void {
+    var r = Reader.init(buf);
+    const expected: u32 = (@as(u32, field_number) << 3) | @backingInt(wt);
+    while (true) {
+        const start = r.ptr;
+        const raw_tag = (r.readRawTag() catch unreachable) orelse break;
+        const tag = decodeTag(raw_tag) catch unreachable;
+        r.skipField(tag, max_recursion_depth) catch unreachable;
+        if (raw_tag == expected) {
+            try w.writeAll(start[0 .. @intFromPtr(r.ptr) - @intFromPtr(start)]);
+        }
+    }
+}
 
 /// Zero-allocation repeated field with packed-slice fast path, tight wire windows,
 /// and lossless multi-chunk submessage merging.
@@ -1404,9 +1443,37 @@ pub fn Repeated(comptime Codec: type) type {
                     }
                 },
                 .packed_slice => |p| {
-                    if (p.data.len == 0) return;
-                    if (comptime (Codec.is_packable and pack)) {
-                        try rw.writeBytes(p.data);
+                    if (comptime !Codec.is_packable) unreachable else {
+                        if (p.data.len == 0) return;
+                        if (comptime pack) {
+                            try rw.writeBytes(p.data);
+                            try rw.writeTag(field_number, .len);
+                        } else {
+                            const sz = self.encodedSize(field_number, pack);
+                            if (sz == 0) return;
+                            const dst = try rw.reserve(sz);
+                            var sw = SliceWriter.init(dst);
+                            try self.encode(field_number, pack, &sw);
+                        }
+                    }
+                },
+                .wire => |wf| {
+                    if (comptime (Codec.is_message and !@hasDecl(Codec.T, "encode"))) {
+                        const sz = rawFieldSpanSize(wf.buf, wf.field_number, Codec.wire_type);
+                        if (sz == 0) return;
+                        const dst = try rw.reserve(sz);
+                        var sw = SliceWriter.init(dst);
+                        try writeRawFieldSpans(wf.buf, wf.field_number, Codec.wire_type, &sw);
+                    } else if (comptime (Codec.is_packable and pack)) {
+                        var payload: usize = 0;
+                        var size_it = self.iterator();
+                        while (size_it.next() catch unreachable) |v| payload += Codec.size(v);
+                        if (payload == 0) return;
+                        const dst = try rw.reserve(payload);
+                        var sw = SliceWriter.init(dst);
+                        var write_it = self.iterator();
+                        while (write_it.next() catch unreachable) |v| Codec.write(&sw, v) catch unreachable;
+                        try rw.writeVarint(payload);
                         try rw.writeTag(field_number, .len);
                     } else {
                         const sz = self.encodedSize(field_number, pack);
@@ -1416,8 +1483,19 @@ pub fn Repeated(comptime Codec: type) type {
                         try self.encode(field_number, pack, &sw);
                     }
                 },
-                .wire, .chunks => {
-                    if (comptime (Codec.is_packable and pack)) {
+                .chunks => |c| {
+                    if (comptime (Codec.is_message and !@hasDecl(Codec.T, "encode"))) {
+                        var i: usize = c.len;
+                        while (i > 0) {
+                            i -= 1;
+                            const s = c.sliceAt(i);
+                            const sz = rawFieldSpanSize(s, c.field_number, Codec.wire_type);
+                            if (sz == 0) continue;
+                            const dst = try rw.reserve(sz);
+                            var sw = SliceWriter.init(dst);
+                            try writeRawFieldSpans(s, c.field_number, Codec.wire_type, &sw);
+                        }
+                    } else if (comptime (Codec.is_packable and pack)) {
                         var payload: usize = 0;
                         var size_it = self.iterator();
                         while (size_it.next() catch unreachable) |v| payload += Codec.size(v);
@@ -1781,12 +1859,40 @@ pub fn Map(comptime KCodec: type, comptime VCodec: type) type {
                         try rw.writeTag(field_number, .len);
                     }
                 },
-                .wire, .chunks => {
-                    const sz = self.encodedSize(field_number);
-                    if (sz == 0) return;
-                    const dst = try rw.reserve(sz);
-                    var sw = SliceWriter.init(dst);
-                    try self.encode(field_number, &sw);
+                .wire => |wf| {
+                    if (comptime (VCodec.is_message and !@hasDecl(VCodec.T, "encode"))) {
+                        const sz = rawFieldSpanSize(wf.buf, wf.field_number, .len);
+                        if (sz == 0) return;
+                        const dst = try rw.reserve(sz);
+                        var sw = SliceWriter.init(dst);
+                        try writeRawFieldSpans(wf.buf, wf.field_number, .len, &sw);
+                    } else {
+                        const sz = self.encodedSize(field_number);
+                        if (sz == 0) return;
+                        const dst = try rw.reserve(sz);
+                        var sw = SliceWriter.init(dst);
+                        try self.encode(field_number, &sw);
+                    }
+                },
+                .chunks => |c| {
+                    if (comptime (VCodec.is_message and !@hasDecl(VCodec.T, "encode"))) {
+                        var i: usize = c.len;
+                        while (i > 0) {
+                            i -= 1;
+                            const s = c.sliceAt(i);
+                            const sz = rawFieldSpanSize(s, c.field_number, .len);
+                            if (sz == 0) continue;
+                            const dst = try rw.reserve(sz);
+                            var sw = SliceWriter.init(dst);
+                            try writeRawFieldSpans(s, c.field_number, .len, &sw);
+                        }
+                    } else {
+                        const sz = self.encodedSize(field_number);
+                        if (sz == 0) return;
+                        const dst = try rw.reserve(sz);
+                        var sw = SliceWriter.init(dst);
+                        try self.encode(field_number, &sw);
+                    }
                 },
             }
         }
@@ -2643,7 +2749,11 @@ pub fn GroupCodec(comptime M: type, comptime field_number: u29) type {
 
         pub fn validate(r: *Reader, depth: u32) DecodeError!void {
             const body = try r.readGroupBytes(field_number, depth);
-            try M.validateDepth(body, depth);
+            if (comptime @hasDecl(M, "validateDepth")) {
+                try M.validateDepth(body, depth);
+            } else {
+                _ = try M.decodeDepth(body, depth);
+            }
         }
     };
 }

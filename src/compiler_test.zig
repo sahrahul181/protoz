@@ -1935,3 +1935,419 @@ test "parser + resolver: diagnostic line/col and duplicate symbol/enum/rpc/exten
     );
     try std.testing.expectError(error.DuplicateExtensionNumber, resolver.Resolver.build(arena, &dup_ext));
 }
+
+test "codegen: avoids shadowing oneof or nested Target/wire declarations" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const parsed = try parser.Parser.parse(arena,
+        \\syntax = "proto3";
+        \\message EntityAttachRequest {
+        \\  oneof Target {
+        \\    string actor = 1;
+        \\    int64 id = 2;
+        \\  }
+        \\  message wire {
+        \\    int32 v = 1;
+        \\  }
+        \\  wire w = 3;
+        \\}
+    );
+    const res = try resolver.Resolver.build(arena, &parsed);
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try codegen.generate(arena, &parsed, &res, &out.writer);
+    const gen = out.written();
+
+    try std.testing.expect(std.mem.indexOf(u8, gen, "const _protoz_wire = @import(\"proto_wire\");") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "fn _protozSkipOrReject(comptime _protoz_Target: type,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "const _protoz_Target = @TypeOf(self.*);") != null);
+}
+
+test "codegen: minimal mode and granular feature flags" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const parsed = try parser.Parser.parse(arena,
+        \\syntax = "proto3";
+        \\message Node {
+        \\  int32 id = 1;
+        \\  Node next = 2;
+        \\  repeated Node children = 3;
+        \\  map<string, Node> links = 4;
+        \\  oneof kind {
+        \\    string label = 5;
+        \\    Node sub = 6;
+        \\  }
+        \\}
+        \\message Empty {}
+    );
+    const res = try resolver.Resolver.build(arena, &parsed);
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try codegen.generateFileWithOptions(arena, 0, &res, &out.writer, codegen.CodegenOptions.minimal("wire"));
+    const gen = out.written();
+
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub fn encodeReverse(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub fn encodeSlice(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub fn decode(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub fn mergeDepth(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "fn _protozSkipOrReject(r: *wire.Reader,") != null);
+
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub fn encodedSize(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub fn encode(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub fn validateDepth(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub fn decodeOnly(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "fn mergeOnlyDepth(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "_protoz_Target") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "_protoz_json_fields") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "FieldIterator") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub fn format(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub fn cloneOwned(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "Node.decodeDepth(sub_bytes, next_depth)") != null);
+}
+
+test "codegen: reachability pruning (--only) with shells, services, extensions, and public imports" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var pub_unused = try parser.Parser.parse(arena, "syntax = \"proto3\"; package dep; message UnusedDep { int32 x = 1; }");
+    pub_unused.name = "dep_unused.proto";
+    var pub_used = try parser.Parser.parse(arena, "syntax = \"proto3\"; package dep; enum UsedEnum { ZERO = 0; ONE = 1; } message UnusedMsg {}");
+    pub_used.name = "dep_used.proto";
+    var main_file = try parser.Parser.parse(arena,
+        \\syntax = "proto2";
+        \\package app;
+        \\import public "dep_unused.proto";
+        \\import public "dep_used.proto";
+        \\message Outer {
+        \\  message Inner {
+        \\    required dep.UsedEnum code = 1;
+        \\  }
+        \\  optional DeadSibling dead_field = 2;
+        \\  message DeadSibling {}
+        \\}
+        \\message Packet {
+        \\  optional Outer.Inner inner = 1;
+        \\  extensions 100 to 199;
+        \\}
+        \\message ExtPayload { optional int32 val = 1; }
+        \\extend Packet {
+        \\  optional ExtPayload ext_payload = 100;
+        \\}
+        \\message DeadRoot {
+        \\  extensions 100 to 199;
+        \\  optional int32 x = 1;
+        \\}
+        \\extend DeadRoot {
+        \\  optional int32 dead_ext = 100;
+        \\}
+        \\service Api {
+        \\  rpc Send (Packet) returns (Packet);
+        \\}
+        \\service DeadSvc {
+        \\  rpc Ping (DeadRoot) returns (DeadRoot);
+        \\}
+    );
+    main_file.name = "app.proto";
+    var pubs = [_]usize{ 0, 1 };
+    main_file.public_imports = &pubs;
+
+    const files = [_]ast.File{ pub_unused, pub_used, main_file };
+    const res = try resolver.Resolver.buildMulti(arena, &files);
+
+    const roots = [_][]const u8{"app.Api"};
+    const rs = try codegen.computeReachable(arena, &res, &roots);
+    try std.testing.expect(!rs.files.contains(0));
+    try std.testing.expect(rs.files.contains(1));
+    try std.testing.expect(rs.files.contains(2));
+
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try codegen.generateFileWithOptions(arena, 2, &res, &out.writer, .{ .reachable = &rs });
+    const gen = out.written();
+
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub const Packet = struct {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub const ExtPayload = struct {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub const ext_payload =") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub const Inner = struct {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub const UsedEnum =") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub const Api = struct {") != null);
+    // Outer is shell-only (no Outer.dead_field / Outer.encodedSize / DeadSibling)
+    try std.testing.expect(std.mem.indexOf(u8, gen, "dead_field") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "DeadSibling") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "DeadRoot") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "DeadSvc") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "UnusedDep") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "UnusedMsg") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "dep_unused") == null);
+
+    try std.testing.expectError(error.UnknownRootSymbol, codegen.computeReachable(arena, &res, &.{"app.NoSuchType"}));
+}
+
+test "wire: minimal message/group fallbacks in MessageCodec, GroupCodec, Repeated, Map, and Lazy" {
+    const MinSub = struct {
+        id: i32 = 0,
+
+        pub fn decodeDepth(bytes: []const u8, depth: u32) wire.DecodeError!@This() {
+            var self: @This() = .{};
+            try self.mergeDepth(bytes, depth);
+            return self;
+        }
+
+        pub fn mergeDepth(self: *@This(), bytes: []const u8, depth: u32) wire.DecodeError!void {
+            if (depth == 0) return error.RecursionLimitExceeded;
+            var r = wire.Reader.init(bytes);
+            while (try r.readRawTag()) |raw_tag| {
+                if (raw_tag == comptime wire.rawTag(1, .varint)) {
+                    self.id = try wire.ScalarCodec(.int32).read(&r, depth - 1);
+                } else {
+                    try r.skipField(try wire.decodeTag(raw_tag), depth - 1);
+                }
+            }
+        }
+
+        pub fn encodeReverse(self: *const @This(), rw: *wire.ReverseWriter) wire.EncodeError!void {
+            if (self.id != 0) {
+                try wire.ScalarCodec(.int32).writeReverse(rw, self.id);
+                try rw.writeTag(1, .varint);
+            }
+        }
+    };
+
+    // Build serialized message chunk 1 & chunk 2: field 1 (MessageCodec MinSub), field 2 (GroupCodec MinSub), field 3 (Map<string, MinSub>)
+    var b1: [64]u8 = undefined;
+    var w1 = wire.SliceWriter.init(&b1);
+    var sub1_buf: [16]u8 = undefined;
+    var rsw1 = wire.ReverseWriter.init(&sub1_buf);
+    try (MinSub{ .id = 11 }).encodeReverse(&rsw1);
+    const sub1 = rsw1.written();
+    try wire.writeTag(&w1, 1, .len);
+    try wire.writeBytes(&w1, sub1);
+    try wire.writeTag(&w1, 2, .sgroup);
+    try w1.writeAll(sub1);
+    try wire.writeTag(&w1, 2, .egroup);
+    var map1_buf: [32]u8 = undefined;
+    var mw1 = wire.SliceWriter.init(&map1_buf);
+    try wire.writeTag(&mw1, 1, .len);
+    try wire.writeBytes(&mw1, "k1");
+    try wire.writeTag(&mw1, 2, .len);
+    try wire.writeBytes(&mw1, sub1);
+    try wire.writeTag(&w1, 3, .len);
+    try wire.writeBytes(&w1, mw1.written());
+    const wire1 = w1.written();
+
+    var b2: [64]u8 = undefined;
+    var w2 = wire.SliceWriter.init(&b2);
+    var sub2_buf: [16]u8 = undefined;
+    var rsw2 = wire.ReverseWriter.init(&sub2_buf);
+    try (MinSub{ .id = 22 }).encodeReverse(&rsw2);
+    const sub2 = rsw2.written();
+    try wire.writeTag(&w2, 1, .len);
+    try wire.writeBytes(&w2, sub2);
+    try wire.writeTag(&w2, 2, .sgroup);
+    try w2.writeAll(sub2);
+    try wire.writeTag(&w2, 2, .egroup);
+    var map2_buf: [32]u8 = undefined;
+    var mw2 = wire.SliceWriter.init(&map2_buf);
+    try wire.writeTag(&mw2, 1, .len);
+    try wire.writeBytes(&mw2, "k2");
+    try wire.writeTag(&mw2, 2, .len);
+    try wire.writeBytes(&mw2, sub2);
+    try wire.writeTag(&w2, 3, .len);
+    try wire.writeBytes(&w2, mw2.written());
+    const wire2 = w2.written();
+
+    const RepMsg = wire.Repeated(wire.MessageCodec(MinSub));
+    const RepGrp = wire.Repeated(wire.GroupCodec(MinSub, 2));
+    const MapMsg = wire.Map(wire.ScalarCodec(.string_utf8), wire.MessageCodec(MinSub));
+    const LazyMsg = wire.Lazy(MinSub);
+
+    var rep_msg: RepMsg = .empty;
+    var rep_grp: RepGrp = .empty;
+    var map_msg: MapMsg = .empty;
+    var lazy_msg: ?LazyMsg = null;
+
+    for ([_][]const u8{ wire1, wire2 }) |buf| {
+        var r = wire.Reader.init(buf);
+        while (true) {
+            const tp = r.ptr;
+            const raw_tag = (try r.readRawTag()) orelse break;
+            switch (raw_tag) {
+                comptime wire.rawTag(1, .len) => try rep_msg.recordUnpacked(buf.ptr, tp, &r, 1, wire.max_recursion_depth),
+                comptime wire.rawTag(2, .sgroup) => try rep_grp.recordUnpacked(buf.ptr, tp, &r, 2, wire.max_recursion_depth),
+                comptime wire.rawTag(3, .len) => try map_msg.recordEntry(buf.ptr, tp, &r, 3, wire.max_recursion_depth),
+                else => unreachable,
+            }
+        }
+    }
+    lazy_msg = .{ .wire = .{ .buf = wire1, .field_number = 1 } };
+
+    // Verify .chunks path under !@hasDecl(M, "encode")
+    var out_buf: [256]u8 = undefined;
+    var rw = wire.ReverseWriter.init(&out_buf);
+    try map_msg.encodeReverse(3, &rw);
+    try rep_grp.encodeReverse(2, false, &rw);
+    try rep_msg.encodeReverse(1, false, &rw);
+    const round_bytes = rw.written();
+
+    var it_r = wire.Reader.init(round_bytes);
+    var seen_ids: [2]i32 = undefined;
+    var seen_count: usize = 0;
+    while (try it_r.readTag()) |tag| {
+        switch (tag.field_number) {
+            1 => {
+                const sub = try wire.MessageCodec(MinSub).read(&it_r, wire.max_recursion_depth);
+                seen_ids[seen_count] = sub.id;
+                seen_count += 1;
+            },
+            else => try it_r.skipField(tag, wire.max_recursion_depth),
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), seen_count);
+    try std.testing.expectEqual(@as(i32, 11), seen_ids[0]);
+    try std.testing.expectEqual(@as(i32, 22), seen_ids[1]);
+
+    // Verify Lazy(MinSub).encodeReverse on .wire without MinSub.encode
+    var lbuf: [64]u8 = undefined;
+    var lrw = wire.ReverseWriter.init(&lbuf);
+    try lazy_msg.?.encodeReverse(&lrw);
+    try std.testing.expectEqualSlices(u8, sub1, lrw.written());
+
+    // Verify single-buffer .wire encodeReverse on Repeated & Map too
+    var rep_single: RepMsg = .empty;
+    var sr = wire.Reader.init(wire1);
+    const tp0 = sr.ptr;
+    _ = (try sr.readRawTag()).?;
+    try rep_single.recordUnpacked(wire1.ptr, tp0, &sr, 1, wire.max_recursion_depth);
+    var sw_buf: [64]u8 = undefined;
+    var sw_rw = wire.ReverseWriter.init(&sw_buf);
+    try rep_single.encodeReverse(1, false, &sw_rw);
+    try std.testing.expect(sw_rw.written().len > 0);
+}
+
+test "plugin: handles minimal and only parameter options" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var keep_msg = std.Io.Writer.Allocating.init(arena);
+    try wire.writeTag(&keep_msg.writer, 1, .len);
+    try wire.writeBytes(&keep_msg.writer, "Keep");
+    var drop_msg = std.Io.Writer.Allocating.init(arena);
+    try wire.writeTag(&drop_msg.writer, 1, .len);
+    try wire.writeBytes(&drop_msg.writer, "Drop");
+
+    var fd = std.Io.Writer.Allocating.init(arena);
+    try wire.writeTag(&fd.writer, 1, .len);
+    try wire.writeBytes(&fd.writer, "pkg/m.proto");
+    try wire.writeTag(&fd.writer, 2, .len);
+    try wire.writeBytes(&fd.writer, "pkg");
+    try wire.writeTag(&fd.writer, 4, .len);
+    try wire.writeBytes(&fd.writer, keep_msg.written());
+    try wire.writeTag(&fd.writer, 4, .len);
+    try wire.writeBytes(&fd.writer, drop_msg.written());
+    try wire.writeTag(&fd.writer, 12, .len);
+    try wire.writeBytes(&fd.writer, "proto3");
+
+    var req = std.Io.Writer.Allocating.init(arena);
+    try wire.writeTag(&req.writer, 1, .len);
+    try wire.writeBytes(&req.writer, "pkg/m.proto");
+    try wire.writeTag(&req.writer, 2, .len);
+    try wire.writeBytes(&req.writer, "minimal=true,only=pkg.Keep");
+    try wire.writeTag(&req.writer, 15, .len);
+    try wire.writeBytes(&req.writer, fd.written());
+
+    const resp = try plugin.processRequest(arena, req.written());
+    var r = wire.Reader.init(resp);
+    var gen: []const u8 = "";
+    while (try r.readTag()) |tag| {
+        if (tag.field_number == 15) {
+            var fr = wire.Reader.init(try r.readBytes());
+            while (try fr.readTag()) |ft| {
+                if (ft.field_number == 15) gen = try fr.readBytes() else try fr.skipField(ft, wire.max_recursion_depth);
+            }
+        } else try r.skipField(tag, wire.max_recursion_depth);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub const Keep = struct {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub const Drop") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub fn encodedSize(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "FieldIterator") == null);
+}
+
+test "codegen: minimal profile omits optional families and collapses mergeDepth" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const src =
+        \\syntax = "proto3";
+        \\package game.v1;
+        \\message Packet {
+        \\  uint64 id = 1;
+        \\  string tag = 2;
+        \\  repeated uint32 vals = 3;
+        \\}
+    ;
+    const file = try parser.Parser.parse(arena, src);
+    const res = try resolver.Resolver.build(arena, &file);
+
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try codegen.generateFileWithOptions(arena, 0, &res, &out.writer, codegen.CodegenOptions.minimal("proto_wire"));
+    const gen = out.written();
+
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub fn decode(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub fn encodeSlice(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub fn encodeReverse(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "_protoz_json_fields") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "FieldIterator") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub fn decodeOnly(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub fn encodedSize(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub fn validateDepth(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub fn cloneOwned(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "@hasField(_protoz_Target") == null);
+}
+
+test "codegen: only_roots prunes unreachable types and emits bare namespace shells for nested targets" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const src =
+        \\syntax = "proto3";
+        \\package game.v1;
+        \\enum UsedEnum { USED_ZERO = 0; }
+        \\enum DeadEnum { DEAD_ZERO = 0; }
+        \\message Outer {
+        \\  message Inner { UsedEnum kind = 1; }
+        \\  message UnusedNested { uint64 x = 1; }
+        \\  string unused_outer_field = 1;
+        \\}
+        \\message Wanted { Outer.Inner item = 1; }
+        \\message Unrelated { DeadEnum d = 1; }
+    ;
+    const file = try parser.Parser.parse(arena, src);
+    const res = try resolver.Resolver.build(arena, &file);
+
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try codegen.generateFileWithOptions(arena, 0, &res, &out.writer, .{
+        .only_roots = &.{"game.v1.Wanted"},
+    });
+    const gen = out.written();
+
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub const Wanted = struct {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub const UsedEnum = enum(i32) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub const Outer = struct {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "pub const Inner = struct {") != null);
+    // Outer is emitted only as a shell (no unused_outer_field), and dead types are pruned
+    try std.testing.expect(std.mem.indexOf(u8, gen, "unused_outer_field") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "UnusedNested") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "Unrelated") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gen, "DeadEnum") == null);
+
+    // Unknown root returns explicit error
+    try std.testing.expectError(
+        error.UnknownRootSymbol,
+        codegen.computeReachable(arena, &res, &.{"game.v1.DoesNotExist"}),
+    );
+}

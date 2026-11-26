@@ -62,16 +62,25 @@ fn writeDepPath(w: *std.Io.Writer, path: []const u8) !void {
     }
 }
 
+fn appendCommaRoots(arena: std.mem.Allocator, list: *std.ArrayList([]const u8), raw: []const u8) !void {
+    var it = std.mem.splitScalar(u8, raw, ',');
+    while (it.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t\r\n");
+        if (trimmed.len > 0) try list.append(arena, trimmed);
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
 
     var include_dirs: std.ArrayList([]const u8) = .empty;
     var entry_files: std.ArrayList([]const u8) = .empty;
+    var only_roots: std.ArrayList([]const u8) = .empty;
     var output_path: ?[]const u8 = null;
     var out_dir: ?[]const u8 = null;
     var root_file_name: ?[]const u8 = null;
     var depfile_path: ?[]const u8 = null;
-    var preserve_unknown_fields = false;
+    var cg_opts: codegen.CodegenOptions = .{};
 
     var args = try init.minimal.args.iterateAllocator(arena);
     _ = args.next(); // argv[0]
@@ -85,7 +94,43 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--depfile")) {
             depfile_path = args.next() orelse return error.MissingDepfilePath;
         } else if (std.mem.eql(u8, arg, "--preserve-unknown-fields")) {
-            preserve_unknown_fields = true;
+            cg_opts.preserve_unknown_fields = true;
+        } else if (std.mem.eql(u8, arg, "--minimal")) {
+            cg_opts.emit_json = false;
+            cg_opts.emit_field_iterator = false;
+            cg_opts.emit_helpers = false;
+            cg_opts.emit_decode_only = false;
+            cg_opts.emit_forward_encode = false;
+            cg_opts.emit_validate = false;
+        } else if (std.mem.eql(u8, arg, "--no-json")) {
+            cg_opts.emit_json = false;
+        } else if (std.mem.eql(u8, arg, "--emit-json")) {
+            cg_opts.emit_json = true;
+        } else if (std.mem.eql(u8, arg, "--no-iter") or std.mem.eql(u8, arg, "--no-field-iterator")) {
+            cg_opts.emit_field_iterator = false;
+        } else if (std.mem.eql(u8, arg, "--emit-iter") or std.mem.eql(u8, arg, "--emit-field-iterator")) {
+            cg_opts.emit_field_iterator = true;
+        } else if (std.mem.eql(u8, arg, "--no-helpers")) {
+            cg_opts.emit_helpers = false;
+        } else if (std.mem.eql(u8, arg, "--emit-helpers")) {
+            cg_opts.emit_helpers = true;
+        } else if (std.mem.eql(u8, arg, "--no-decode-only")) {
+            cg_opts.emit_decode_only = false;
+        } else if (std.mem.eql(u8, arg, "--emit-decode-only")) {
+            cg_opts.emit_decode_only = true;
+        } else if (std.mem.eql(u8, arg, "--no-forward-encode")) {
+            cg_opts.emit_forward_encode = false;
+        } else if (std.mem.eql(u8, arg, "--emit-forward-encode")) {
+            cg_opts.emit_forward_encode = true;
+        } else if (std.mem.eql(u8, arg, "--no-validate")) {
+            cg_opts.emit_validate = false;
+        } else if (std.mem.eql(u8, arg, "--emit-validate")) {
+            cg_opts.emit_validate = true;
+        } else if (std.mem.eql(u8, arg, "--only")) {
+            const raw = args.next() orelse return error.MissingOnlyRoots;
+            try appendCommaRoots(arena, &only_roots, raw);
+        } else if (std.mem.startsWith(u8, arg, "--only=")) {
+            try appendCommaRoots(arena, &only_roots, arg["--only=".len..]);
         } else if (std.mem.eql(u8, arg, "-I") or std.mem.eql(u8, arg, "--proto-path")) {
             try include_dirs.append(arena, args.next() orelse return error.MissingIncludeDir);
         } else if (std.mem.startsWith(u8, arg, "-I")) {
@@ -110,14 +155,26 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
     const res = try resolver.Resolver.buildMultiWithDiag(arena, ws.files, &diag);
+
+    var rs_storage: codegen.ReachableSet = undefined;
+    if (only_roots.items.len > 0) {
+        cg_opts.only_roots = only_roots.items;
+        rs_storage = try codegen.computeReachable(arena, &res, only_roots.items);
+        cg_opts.reachable = &rs_storage;
+    }
+
     const cwd = std.Io.Dir.cwd();
 
     if (out_dir) |raw_dir_path| {
         const dir_path = try loader.Loader.normalizePath(arena, raw_dir_path);
         try cwd.createDirPath(init.io, dir_path);
         var buf: [8192]u8 = undefined;
+        var emitted_files: std.ArrayList([]const u8) = .empty;
 
         for (ws.files, 0..) |file, idx| {
+            if (cg_opts.reachable) |rs| {
+                if (!rs.files.contains(idx)) continue;
+            }
             const rel_zig = try codegen.protoToZigRelPath(arena, file.name);
             const full_out = try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir_path, rel_zig });
             if (parentDir(full_out)) |pdir| try cwd.createDirPath(init.io, pdir);
@@ -125,10 +182,9 @@ pub fn main(init: std.process.Init) !void {
             const out_file = try cwd.createFile(init.io, full_out, .{});
             defer out_file.close(init.io);
             var writer = out_file.writerStreaming(init.io, &buf);
-            try codegen.generateFileWithOptions(arena, idx, &res, &writer.interface, .{
-                .preserve_unknown_fields = preserve_unknown_fields,
-            });
+            try codegen.generateFileWithOptions(arena, idx, &res, &writer.interface, cg_opts);
             try writer.interface.flush();
+            try emitted_files.append(arena, file.name);
         }
 
         const root_rel = root_file_name orelse "root.zig";
@@ -139,9 +195,9 @@ pub fn main(init: std.process.Init) !void {
             var rw = rf.writerStreaming(init.io, &buf);
             var used_exports: std.StringHashMapUnmanaged(void) = .empty;
             try rw.interface.writeAll("// Auto-generated package root by zig-protoc.\n");
-            for (ws.files) |file| {
-                const rel_zig = try codegen.protoToZigRelPath(arena, file.name);
-                const export_name = try makeUniqueRootExportName(arena, file.name, &used_exports);
+            for (emitted_files.items) |file_name| {
+                const rel_zig = try codegen.protoToZigRelPath(arena, file_name);
+                const export_name = try makeUniqueRootExportName(arena, file_name, &used_exports);
                 try rw.interface.writeAll("pub const ");
                 try codegen.writeIdent(&rw.interface, export_name);
                 try rw.interface.print(" = @import(\"{s}\");\n", .{rel_zig});
@@ -175,15 +231,11 @@ pub fn main(init: std.process.Init) !void {
         const out_file = try cwd.createFile(init.io, clean_out, .{});
         defer out_file.close(init.io);
         var writer = out_file.writerStreaming(init.io, &buf);
-        try codegen.generateFileWithOptions(arena, target_idx, &res, &writer.interface, .{
-            .preserve_unknown_fields = preserve_unknown_fields,
-        });
+        try codegen.generateFileWithOptions(arena, target_idx, &res, &writer.interface, cg_opts);
         try writer.interface.flush();
     } else {
         var writer = std.Io.File.stdout().writerStreaming(init.io, &buf);
-        try codegen.generateFileWithOptions(arena, target_idx, &res, &writer.interface, .{
-            .preserve_unknown_fields = preserve_unknown_fields,
-        });
+        try codegen.generateFileWithOptions(arena, target_idx, &res, &writer.interface, cg_opts);
         try writer.interface.flush();
     }
 }
