@@ -57,6 +57,7 @@ pub const Message = struct {
     oneofs: []Oneof,
     nested_messages: []Message,
     nested_enums: []Enum,
+    options: []const Option = &.{},
     reserved_ranges: []const ReservedRange = &.{},
     reserved_names: []const []const u8 = &.{},
     extension_ranges: []const ReservedRange = &.{},

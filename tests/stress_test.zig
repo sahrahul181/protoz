@@ -471,6 +471,29 @@ test "stress: Edition 2023 strict vs NONE UTF-8 validation & explicit presence" 
     try wire.writeTag(&sw, 2, .len);
     try wire.writeBytes(&sw, "\xff");
     try std.testing.expectError(error.InvalidUtf8, editions.EditionConfig.decode(sw.written()));
+
+    // Edition 2023 DELIMITED message_encoding + LEGACY_REQUIRED enforcement
+    try std.testing.expectError(error.MissingRequiredField, editions.EditionStrictChild.decode(""));
+    var items = [_]editions.EditionStrictChild{.{ .id = "i1" }};
+    const bad_host = editions.EditionDelimitedHost{ .items = .{ .slice = &items } };
+    var host_buf: [256]u8 = undefined;
+    const host_wire = try bad_host.encodeSlice(&host_buf);
+    // Verify DELIMITED wire format emits .sgroup/.egroup on field 2
+    var hr = wire.Reader.init(host_wire);
+    const htag = (try hr.readTag()).?;
+    try std.testing.expectEqual(@as(u29, 2), htag.field_number);
+    try std.testing.expectEqual(wire.WireType.sgroup, htag.wire_type);
+    const host_dec = try editions.EditionDelimitedHost.decode(host_wire);
+    var hit = host_dec.items.iterator();
+    try std.testing.expectEqualStrings("i1", (try hit.next()).?.id.?);
+    try std.testing.expectEqual(@as(?editions.EditionStrictChild, null), try hit.next());
+
+    // Missing LEGACY_REQUIRED field inside nested DELIMITED child fails decode
+    var bad_delim_wire: [32]u8 = undefined;
+    var bdw = wire.SliceWriter.init(&bad_delim_wire);
+    try wire.writeTag(&bdw, 1, .sgroup);
+    try wire.writeTag(&bdw, 1, .egroup);
+    try std.testing.expectError(error.MissingRequiredField, editions.EditionDelimitedHost.decode(bdw.written()));
 }
 
 test "stress: recursion depth boundary (99 succeeds, 101 fails)" {

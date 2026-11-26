@@ -16,3 +16,13 @@ message EditionConfig {
   reserved 99;
   reserved retired_edition_col;
 }
+
+message EditionStrictChild {
+  string id = 1 [features.field_presence = LEGACY_REQUIRED];
+}
+
+message EditionDelimitedHost {
+  option features.message_encoding = DELIMITED;
+  EditionStrictChild child = 1;
+  repeated EditionStrictChild items = 2;
+}

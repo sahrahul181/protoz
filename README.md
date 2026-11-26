@@ -202,6 +202,15 @@ const resp_frame = try protoz.rpc.dispatchUnaryGrpc(
 
 ---
 
+## Scope & Intentional Boundaries
+
+- **Protobuf coverage:** Supports `proto2` (including `group`, `extensions`, `extend`, custom `defaults`, and transitive `required` validation), `proto3` (including `proto3 optional`), and **Edition 2023** (`field_presence`, `repeated_field_encoding`, `utf8_validation`, and `message_encoding = DELIMITED` in both `zig-protoc` and `protoc-gen-zig`).
+- **Not included in v0.1.0:** `import weak` (parsed and skipped), arbitrary runtime custom descriptor options, and `textproto` parsing (human-readable `{f}` debug formatting and ProtoJSON are provided instead).
+- **gRPC & transport:** `protoz.rpc` handles 5-byte Length-Prefixed framing and zero-allocation comptime dispatchers (`dispatchUnaryGrpc`, `dispatchClientStreamGrpc`, `dispatchServerStreamGrpc`, `dispatchBidiStreamGrpc`, `dispatchGrpc`). Compressed gRPC payloads (`compressed = 1`) are exposed via `rpc.tryDecodeGrpcRaw` for caller-chosen decompression, and full HTTP/2 transport (HPACK, TLS, multiplexing) is left to the application's transport layer.
+- **`google.protobuf.Any` in ProtoJSON:** Inline JSON expansion uses a zero-allocation comptime type tuple (`encodeMessageSliceWithTypes` / `decodeMessageWithTypes`); unregistered types fall back cleanly to `{"@type":"...","value":"<base64>"}`.
+
+---
+
 ## Benchmarks
 
 Run the reproducible suite locally (`--filter` supported):

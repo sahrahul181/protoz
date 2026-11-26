@@ -5,6 +5,11 @@ const resolver = @import("resolver.zig");
 const codegen = @import("codegen.zig");
 
 pub const feature_proto3_optional: u64 = 1;
+pub const feature_supports_editions: u64 = 2;
+
+pub const edition_proto2: i32 = 998;
+pub const edition_proto3: i32 = 999;
+pub const edition_2023: i32 = 1000;
 
 pub const GeneratedFile = struct {
     name: []const u8,
@@ -13,7 +18,9 @@ pub const GeneratedFile = struct {
 
 pub const Response = struct {
     err: ?[]const u8 = null,
-    supported_features: u64 = feature_proto3_optional,
+    supported_features: u64 = feature_proto3_optional | feature_supports_editions,
+    minimum_edition: ?i32 = edition_proto2,
+    maximum_edition: ?i32 = edition_2023,
     files: []const GeneratedFile = &.{},
 };
 
@@ -73,6 +80,14 @@ pub fn encodeResponse(arena: std.mem.Allocator, resp: Response) ![]u8 {
     if (resp.supported_features != 0) {
         try wire.writeTag(w, 2, .varint);
         try wire.writeVarint(w, resp.supported_features);
+    }
+    if (resp.minimum_edition) |min_ed| {
+        try wire.writeTag(w, 3, .varint);
+        try wire.writeVarint(w, @bitCast(@as(i64, min_ed)));
+    }
+    if (resp.maximum_edition) |max_ed| {
+        try wire.writeTag(w, 4, .varint);
+        try wire.writeVarint(w, @bitCast(@as(i64, max_ed)));
     }
     for (resp.files) |f| {
         const entry_size =
@@ -153,9 +168,57 @@ fn processRequestTyped(arena: std.mem.Allocator, req_bytes: []const u8) !Respons
     }
 
     return .{
-        .supported_features = feature_proto3_optional,
+        .supported_features = feature_proto3_optional | feature_supports_editions,
+        .minimum_edition = edition_proto2,
+        .maximum_edition = edition_2023,
         .files = try generated.toOwnedSlice(arena),
     };
+}
+
+fn decodeFeatureSet(arena: std.mem.Allocator, bytes: []const u8, out: *std.ArrayList(ast.Option)) !void {
+    var r = wire.Reader.init(bytes);
+    while (try r.readTag()) |tag| {
+        switch (tag.field_number) {
+            1 => { // FieldPresence
+                const v = try r.readVarint();
+                const name: ?[]const u8 = switch (v) {
+                    1 => "EXPLICIT",
+                    2 => "IMPLICIT",
+                    3 => "LEGACY_REQUIRED",
+                    else => null,
+                };
+                if (name) |n| try out.append(arena, .{ .name = "features.field_presence", .raw_value = n });
+            },
+            3 => { // RepeatedFieldEncoding
+                const v = try r.readVarint();
+                const name: ?[]const u8 = switch (v) {
+                    1 => "PACKED",
+                    2 => "EXPANDED",
+                    else => null,
+                };
+                if (name) |n| try out.append(arena, .{ .name = "features.repeated_field_encoding", .raw_value = n });
+            },
+            4 => { // Utf8Validation
+                const v = try r.readVarint();
+                const name: ?[]const u8 = switch (v) {
+                    2 => "VERIFY",
+                    3 => "NONE",
+                    else => null,
+                };
+                if (name) |n| try out.append(arena, .{ .name = "features.utf8_validation", .raw_value = n });
+            },
+            5 => { // MessageEncoding
+                const v = try r.readVarint();
+                const name: ?[]const u8 = switch (v) {
+                    1 => "LENGTH_PREFIXED",
+                    2 => "DELIMITED",
+                    else => null,
+                };
+                if (name) |n| try out.append(arena, .{ .name = "features.message_encoding", .raw_value = n });
+            },
+            else => try r.skipField(tag, wire.max_recursion_depth),
+        }
+    }
 }
 
 // --- google.protobuf.FileDescriptorProto wire decoder -> ast.File ---
@@ -166,6 +229,7 @@ fn decodeFileDescriptorProto(arena: std.mem.Allocator, bytes: []const u8) !ast.F
     var syntax: ast.Syntax = .proto2;
     var imports: std.ArrayList([]const u8) = .empty;
     var public_imports: std.ArrayList(usize) = .empty;
+    var file_opts: std.ArrayList(ast.Option) = .empty;
     var enums: std.ArrayList(ast.Enum) = .empty;
     var raw_msgs: std.ArrayList([]const u8) = .empty;
     var services: std.ArrayList(ast.Service) = .empty;
@@ -181,6 +245,16 @@ fn decodeFileDescriptorProto(arena: std.mem.Allocator, bytes: []const u8) !ast.F
             5 => try enums.append(arena, try decodeEnumDescriptor(arena, try r.readBytes())),
             6 => try services.append(arena, try decodeServiceDescriptorProto(arena, try r.readBytes())),
             7 => try raw_exts.append(arena, try decodeFieldDescriptor(try r.readBytes())),
+            8 => { // FileOptions
+                var fr = wire.Reader.init(try r.readBytes());
+                while (try fr.readTag()) |ft| {
+                    if (ft.field_number == 50) {
+                        try decodeFeatureSet(arena, try fr.readBytes(), &file_opts);
+                    } else {
+                        try fr.skipField(ft, wire.max_recursion_depth);
+                    }
+                }
+            },
             10 => { // public_dependency (repeated int32, packed or unpacked)
                 if (tag.wire_type == .len) {
                     var pr = wire.Reader.init(try r.readBytes());
@@ -203,6 +277,10 @@ fn decodeFileDescriptorProto(arena: std.mem.Allocator, bytes: []const u8) !ast.F
                     syntax = .proto2;
                 }
             },
+            14 => { // Edition enum
+                const ed: i32 = @truncate(@as(i64, @bitCast(try r.readVarint())));
+                if (ed >= edition_2023) syntax = .edition;
+            },
             else => try r.skipField(tag, wire.max_recursion_depth),
         }
     }
@@ -220,7 +298,7 @@ fn decodeFileDescriptorProto(arena: std.mem.Allocator, bytes: []const u8) !ast.F
         .package = package,
         .imports = try imports.toOwnedSlice(arena),
         .public_imports = try public_imports.toOwnedSlice(arena),
-        .options = &.{},
+        .options = try file_opts.toOwnedSlice(arena),
         .messages = try messages.toOwnedSlice(arena),
         .enums = try enums.toOwnedSlice(arena),
         .services = try services.toOwnedSlice(arena),
@@ -324,6 +402,7 @@ const RawField = struct {
     type_name: []const u8 = "",
     default_value: ?[]const u8 = null,
     packed_opt: ?bool = null,
+    feature_bytes: ?[]const u8 = null,
     oneof_index: ?usize = null,
     proto3_optional: bool = false,
 };
@@ -369,6 +448,9 @@ fn buildFieldOptions(arena: std.mem.Allocator, rf: RawField) ![]ast.Option {
     if (rf.default_value) |dv| {
         try opts.append(arena, .{ .name = "default", .raw_value = dv });
     }
+    if (rf.feature_bytes) |fb| {
+        try decodeFeatureSet(arena, fb, &opts);
+    }
     return opts.toOwnedSlice(arena);
 }
 
@@ -411,6 +493,8 @@ fn decodeFieldDescriptor(bytes: []const u8) !RawField {
                 while (try ordr.readTag()) |ot| {
                     if (ot.field_number == 2) {
                         f.packed_opt = (try ordr.readVarint()) != 0;
+                    } else if (ot.field_number == 21) {
+                        f.feature_bytes = try ordr.readBytes();
                     } else {
                         try ordr.skipField(ot, wire.max_recursion_depth);
                     }
@@ -437,6 +521,7 @@ fn decodeDescriptorProto(
     var oneof_names: std.ArrayList([]const u8) = .empty;
     var extension_ranges: std.ArrayList(ast.ReservedRange) = .empty;
     var raw_exts: std.ArrayList(RawField) = .empty;
+    var msg_opts: std.ArrayList(ast.Option) = .empty;
     var is_map_entry = false;
 
     var r = wire.Reader.init(bytes);
@@ -467,6 +552,8 @@ fn decodeDescriptorProto(
                 while (try mr.readTag()) |mt| {
                     if (mt.field_number == 7) {
                         is_map_entry = (try mr.readVarint()) != 0;
+                    } else if (mt.field_number == 12) {
+                        try decodeFeatureSet(arena, try mr.readBytes(), &msg_opts);
                     } else {
                         try mr.skipField(mt, wire.max_recursion_depth);
                     }
@@ -608,6 +695,7 @@ fn decodeDescriptorProto(
             .oneofs = try oneofs.toOwnedSlice(arena),
             .nested_messages = try nested_messages.toOwnedSlice(arena),
             .nested_enums = try nested_enums.toOwnedSlice(arena),
+            .options = try msg_opts.toOwnedSlice(arena),
             .extension_ranges = try extension_ranges.toOwnedSlice(arena),
             .extensions = try buildExtensionDecls(arena, raw_exts.items),
         },
